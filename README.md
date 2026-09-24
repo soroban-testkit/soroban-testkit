@@ -89,6 +89,9 @@ for things that don't belong in a dev-dependency:
 # Soroban-specific flags since contract tests run natively).
 soroban-testkit coverage --format html --open
 
+# Machine-readable coverage report
+soroban-testkit coverage --format json --output coverage.json
+
 # Empirically find how many recipients a batch operation can handle
 # before it exceeds mainnet resource limits.
 soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm \
@@ -99,8 +102,10 @@ soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm 
 soroban-testkit audit ./src --strict
 ```
 
-`limits` ramps a numeric parameter directly, or generates addresses for a
-`Vec<Address>` parameter — the common "how many recipients" question.
+`limits` ramps numeric and `Bytes` parameters directly, or ramps a `Vec<T>`
+by element count. Use repeated `--arg NAME=VALUE` options for non-ramped
+scalar values; `Bytes` overrides use `0x`-prefixed hex. The command refines
+the first failing ramp value with binary search.
 Every ramp attempt runs in its own subprocess: a real `.wasm` contract
 that exceeds resource limits can abort the process outright rather than
 return an error, and isolating each attempt is the only safe way to probe

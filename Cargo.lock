@@ -1866,6 +1866,7 @@ dependencies = [
  "quote",
  "soroban-sdk",
  "soroban-spec",
+ "stellar-strkey 0.0.16",
  "syn 3.0.5",
  "walkdir",
 ]

@@ -551,20 +551,21 @@ Use `clap` with derive. Three subcommands, built in this order.
 Wraps coverage collection for the WASM target, which does not work out of the box.
 
 ```
-soroban-testkit coverage [--format text|lcov|html] [--fail-under <pct>] [--open]
+soroban-testkit coverage [--format text|lcov|html|json] [--fail-under <pct>] [--open]
 ```
 
 Shells out to the underlying coverage tool. Its job is knowing the right flags for Soroban's target, not reimplementing coverage.
+JSON mode writes machine-readable cargo-llvm-cov output to `coverage.json` by default, or to `--output <path>`. When only `--output-dir` is provided, it writes `<dir>/coverage.json`. `--open` is HTML-only.
 
 ### `soroban-testkit limits`
 
 Empirically discovers resource ceilings rather than guessing them.
 
 ```
-soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param>
+soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...]
 ```
 
-Invokes the function with an increasing parameter (e.g. recipient count) until it exceeds resource limits, then reports the last successful value plus instruction count, ledger reads/writes, and transaction size at that point.
+Invokes the function with an increasing parameter (e.g. recipient count) until it exceeds resource limits, refines the boundary with binary search, then reports the last successful value plus instruction count and memory at that point. `Bytes` ramp parameters vary by length and contain zero bytes. Use repeatable `--arg NAME=VALUE` options to set non-ramped scalar parameters; values are parsed according to the Soroban type, and `Bytes` values use `0x`-prefixed hexadecimal. These overrides are forwarded to each isolated probe. Unsupported aggregate types produce an actionable error.
 
 **This directly answers the `batch_payout` maximum-recipients question** and is the CLI's most compelling demo. Feature it in the README.
 

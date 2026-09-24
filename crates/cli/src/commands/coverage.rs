@@ -13,6 +13,8 @@ pub enum Format {
     Lcov,
     /// A browsable HTML report.
     Html,
+    /// Machine-readable coverage data from cargo-llvm-cov.
+    Json,
 }
 
 /// Arguments for `soroban-testkit coverage`.
@@ -39,6 +41,9 @@ pub struct CoverageArgs {
     /// Defaults to the current directory.
     #[arg(long, value_name = "DIR")]
     output_dir: Option<std::path::PathBuf>,
+    /// Write JSON to this path (defaults to coverage.json).
+    #[arg(long, value_name = "PATH")]
+    output: Option<std::path::PathBuf>,
 }
 
 /// Wraps `cargo llvm-cov test`, which handles Soroban's coverage needs
@@ -98,6 +103,16 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
                 .to_string(),
         ));
     }
+    if args.output.is_some() && !matches!(args.format, Format::Json) {
+        return Err(CliError(
+            "--output is only valid with --format json".to_string(),
+        ));
+    }
+    if args.open && matches!(args.format, Format::Json) {
+        return Err(CliError(
+            "--open is only valid with --format html".to_string(),
+        ));
+    }
 
     let mut cmd = Command::new("cargo");
     cmd.arg("llvm-cov").arg("test");
@@ -129,6 +144,16 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
                 cmd.arg("--output-dir").arg(dir);
             }
         }
+        Format::Json => {
+            cmd.arg("--json");
+            let output_path = args.output.clone().unwrap_or_else(|| {
+                args.output_dir
+                    .as_ref()
+                    .map(|dir| dir.join("coverage.json"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
+            });
+            cmd.arg("--output-path").arg(output_path);
+        }
     }
 
     if args.open {
@@ -157,6 +182,7 @@ mod tests {
             include: include.iter().map(|s| s.to_string()).collect(),
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
             output_dir: None,
+            output: None,
         }
     }
 
@@ -317,5 +343,64 @@ mod tests {
                 "./my coverage results",
             ]
         );
+    }
+
+    #[test]
+    fn json_format_writes_default_file() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        assert_eq!(
+            rendered_args(&build_command(&a).unwrap()),
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "coverage.json"
+            ]
+        );
+    }
+
+    #[test]
+    fn json_format_respects_output_path_and_directory() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output_dir = Some(std::path::PathBuf::from("reports"));
+        assert_eq!(
+            rendered_args(&build_command(&a).unwrap()),
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "reports/coverage.json"
+            ]
+        );
+        a.output = Some(std::path::PathBuf::from("result.json"));
+        assert_eq!(
+            rendered_args(&build_command(&a).unwrap()).last().unwrap(),
+            "result.json"
+        );
+    }
+
+    #[test]
+    fn json_output_option_is_rejected_for_other_formats() {
+        let mut a = args(&[], &[]);
+        a.output = Some(std::path::PathBuf::from("result.json"));
+        assert!(build_command(&a)
+            .unwrap_err()
+            .0
+            .contains("only valid with --format json"));
+    }
+
+    #[test]
+    fn json_cannot_be_opened_as_html() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.open = true;
+        assert!(build_command(&a)
+            .unwrap_err()
+            .0
+            .contains("only valid with --format html"));
     }
 }

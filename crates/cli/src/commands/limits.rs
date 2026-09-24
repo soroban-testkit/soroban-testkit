@@ -6,7 +6,7 @@ use clap::Args;
 use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
 use soroban_sdk::token::StellarAssetClient;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef};
-use soroban_sdk::{Address, Env, IntoVal, Symbol, Val, Vec as SVec};
+use soroban_sdk::{Address, Env, IntoVal, Symbol, TryFromVal, Val, Vec as SVec};
 
 use super::CliError;
 
@@ -22,6 +22,10 @@ pub struct LimitsArgs {
     /// The parameter to increase on each attempt.
     #[arg(long, value_name = "PARAM")]
     ramp: String,
+    /// Explicit value for a non-ramped parameter, as NAME=VALUE. Repeatable.
+    /// Scalars use their Soroban type; Bytes uses 0x-prefixed hexadecimal.
+    #[arg(long = "arg", value_name = "NAME=VALUE")]
+    arg_values: Vec<String>,
     /// Kill and treat as a failure any single probe that runs longer than
     /// this many seconds. Guards against a ramp value that hangs the host
     /// (rather than erroring or aborting) turning `limits` into an
@@ -65,6 +69,8 @@ pub struct ProbeArgs {
     ramp: String,
     #[arg(long)]
     value: u32,
+    #[arg(long = "arg", value_name = "NAME=VALUE")]
+    arg_values: Vec<String>,
 }
 
 /// Empirically discovers a resource ceiling by invoking `--fn` with an
@@ -115,7 +121,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     // reports its actual cause instead of the generic "failed at value 1"
     // a swallowed child-process error would otherwise produce.
     let (_, env, function, ramp_index) = load(&args.contract, &args.function, &args.ramp)?;
-    build_args(&env, &function, ramp_index, 1)?;
+    build_args(&env, &function, ramp_index, 1, &args.arg_values)?;
     drop(env);
 
     let self_exe = std::env::current_exe()
@@ -137,6 +143,11 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             .arg(&args.ramp)
             .arg("--value")
             .arg(value.to_string())
+            .args(
+                args.arg_values
+                    .iter()
+                    .flat_map(|value| ["--arg", value.as_str()]),
+            )
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -188,18 +199,9 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     // tighter bound, if we found one.
     let mut best = last_ok;
     if let Some(hi_start) = high {
-        let mut lo = last_ok;
-        let mut hi = hi_start;
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if probe(mid)? {
-                lo = mid;
-            } else {
-                last_failed_probe = Some(mid);
-                hi = mid;
-            }
-        }
-        best = lo;
+        let (last_success, first_failure) = refine_upper_bound(last_ok, hi_start, &mut probe)?;
+        best = last_success;
+        last_failed_probe = Some(first_failure);
     }
 
     // Measure resources at the best-known-good value, in-process this
@@ -272,6 +274,21 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn refine_upper_bound<F>(mut low: u32, mut high: u32, probe: &mut F) -> Result<(u32, u32), CliError>
+where
+    F: FnMut(u32) -> Result<bool, CliError>,
+{
+    while low.saturating_add(1) < high {
+        let middle = low + (high - low) / 2;
+        if probe(middle)? {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Ok((low, high))
+}
+
 /// The hidden probe entry point: performs exactly one invocation and
 /// returns `Ok(())` (exit 0) or `Err` (exit 1) — no measurement, no
 /// output. Run in its own process by [`run`].
@@ -279,7 +296,7 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     let _quiet = QuietPanics::install();
     let (contract_id, env, function, ramp_index) =
         load(&args.contract, &args.function, &args.ramp)?;
-    let args_vec = build_args(&env, &function, ramp_index, args.value)?;
+    let args_vec = build_args(&env, &function, ramp_index, args.value, &args.arg_values)?;
     let func = Symbol::new(&env, &args.function);
     if invoke_succeeds(&env, &contract_id, &func, args_vec) {
         Ok(())
@@ -548,7 +565,7 @@ fn measure(args: &LimitsArgs, value: u32) -> Result<(u64, u64), CliError> {
     let func = Symbol::new(&env, &args.function);
     let mut budget = env.cost_estimate().budget();
     budget.reset_default();
-    let args_vec = build_args(&env, &function, ramp_index, value)?;
+    let args_vec = build_args(&env, &function, ramp_index, value, &args.arg_values)?;
     if !invoke_succeeds(&env, &contract_id, &func, args_vec) {
         return Err(CliError(
             "internal error: the ramp value chosen as successful failed on re-measurement"
@@ -635,18 +652,121 @@ fn build_args(
     function: &ScSpecFunctionV0,
     ramp_index: usize,
     ramp_value: u32,
+    explicit: &[String],
 ) -> Result<SVec<Val>, CliError> {
+    let mut overrides = std::collections::HashMap::new();
+    for item in explicit {
+        let (name, value) = item
+            .split_once('=')
+            .ok_or_else(|| CliError(format!("invalid --arg {item:?}; expected NAME=VALUE")))?;
+        if name.is_empty()
+            || overrides
+                .insert(name.to_string(), value.to_string())
+                .is_some()
+        {
+            return Err(CliError(format!(
+                "empty or duplicate --arg parameter {name:?}"
+            )));
+        }
+    }
     let admin = Address::generate(env);
     let mut vals = SVec::new(env);
+    let ramp_name = function.inputs[ramp_index].name.to_utf8_string_lossy();
+    for name in overrides.keys() {
+        if name == ramp_name.as_ref() {
+            return Err(CliError(format!(
+                "--arg cannot override ramp parameter {name:?}"
+            )));
+        }
+        if !function
+            .inputs
+            .iter()
+            .any(|input| input.name.to_utf8_string_lossy().as_ref() == name)
+        {
+            return Err(CliError(format!("--arg names unknown parameter {name:?}")));
+        }
+    }
     for (i, input) in function.inputs.iter().enumerate() {
+        let input_name = input.name.to_utf8_string_lossy();
         let val = if i == ramp_index {
             ramp_val(env, &input.type_, ramp_value)?
+        } else if let Some(value) = overrides.get(input_name.as_ref()) {
+            explicit_val(env, &input.type_, value)?
         } else {
             default_val(env, &admin, &input.type_, input)?
         };
         vals.push_back(val);
     }
     Ok(vals)
+}
+
+fn explicit_val(env: &Env, type_: &ScSpecTypeDef, value: &str) -> Result<Val, CliError> {
+    macro_rules! parse {
+        ($ty:ty) => {
+            value
+                .parse::<$ty>()
+                .map_err(|err| CliError(format!("invalid value {value:?}: {err}")))?
+                .into_val(env)
+        };
+    }
+    match type_ {
+        ScSpecTypeDef::Bool => value
+            .parse::<bool>()
+            .map(|v| v.into_val(env))
+            .map_err(|_| CliError(format!("invalid bool value {value:?}; use true or false"))),
+        ScSpecTypeDef::U32 => Ok(parse!(u32)),
+        ScSpecTypeDef::I32 => Ok(parse!(i32)),
+        ScSpecTypeDef::U64 => Ok(parse!(u64)),
+        ScSpecTypeDef::I64 => Ok(parse!(i64)),
+        ScSpecTypeDef::U128 => Ok(parse!(u128)),
+        ScSpecTypeDef::I128 => Ok(parse!(i128)),
+        ScSpecTypeDef::Symbol => {
+            let string = soroban_sdk::String::from_str(env, value);
+            Symbol::try_from_val(env, &string)
+                .map(|symbol| symbol.into_val(env))
+                .map_err(|err| CliError(format!("invalid Symbol value {value:?}: {err:?}")))
+        }
+        ScSpecTypeDef::String => Ok(soroban_sdk::String::from_str(env, value).into_val(env)),
+        ScSpecTypeDef::Bytes => {
+            let hex = value
+                .strip_prefix("0x")
+                .ok_or_else(|| CliError("Bytes --arg values must start with 0x".to_string()))?;
+            let bytes = decode_hex(hex)?;
+            Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
+        }
+        ScSpecTypeDef::Address => {
+            let strkey = value
+                .parse::<stellar_strkey::Strkey>()
+                .map_err(|err| CliError(format!("invalid Stellar address {value:?}: {err}")))?;
+            if !matches!(
+                strkey,
+                stellar_strkey::Strkey::PublicKeyEd25519(_) | stellar_strkey::Strkey::Contract(_)
+            ) {
+                return Err(CliError(format!(
+                    "{value:?} is a valid strkey but not an account or contract address"
+                )));
+            }
+            Ok(Address::from_str(env, value).into_val(env))
+        }
+        other => Err(CliError(format!(
+            "--arg does not support explicit values for {other:?}"
+        ))),
+    }
+}
+
+fn decode_hex(hex: &str) -> Result<Vec<u8>, CliError> {
+    if hex.len() % 2 != 0 {
+        return Err(CliError(
+            "Bytes --arg hex must contain pairs of digits".to_string(),
+        ));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|_| CliError(format!("invalid hexadecimal Bytes value {hex:?}")))
+        })
+        .collect()
 }
 
 fn invoke_succeeds(env: &Env, contract_id: &Address, func: &Symbol, args: SVec<Val>) -> bool {
@@ -668,6 +788,10 @@ fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, Cl
         ScSpecTypeDef::I64 => Ok((ramp_value as i64).into_val(env)),
         ScSpecTypeDef::U128 => Ok((ramp_value as u128).into_val(env)),
         ScSpecTypeDef::I128 => Ok((ramp_value as i128).into_val(env)),
+        ScSpecTypeDef::Bytes => {
+            let bytes = vec![0u8; ramp_value as usize];
+            Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
+        }
         // Any Vec<T> is ramped as its element *count*, filled with a fixed
         // per-element value from `vec_element_val` — the same "maximum
         // recipients" shape as the original Vec<Address>-only support, now
@@ -684,7 +808,7 @@ fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, Cl
         }
         other => Err(CliError(format!(
             "the ramp parameter's type ({other:?}) isn't supported yet; supported ramp types \
-             are u32/i32/u64/i64/u128/i128 and Vec<T> (for the element types listed in \
+            are u32/i32/u64/i64/u128/i128, Bytes, and Vec<T> (for the element types listed in \
              the Vec<T> element-type error, if T itself isn't supported)"
         ))),
     }
@@ -837,6 +961,44 @@ mod tests {
         let env = Env::default();
         let err = ramp_val(&env, &ScSpecTypeDef::Void, 1).unwrap_err();
         assert!(err.0.contains("isn't supported yet"), "{}", err.0);
+    }
+
+    #[test]
+    fn ramp_val_bytes_uses_the_requested_length() {
+        let env = Env::default();
+        let val = ramp_val(&env, &ScSpecTypeDef::Bytes, 4).unwrap();
+        let bytes: soroban_sdk::Bytes = val.into_val(&env);
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes.get(0), Some(0));
+    }
+
+    #[test]
+    fn explicit_values_parse_typed_scalars_and_bytes() {
+        let env = Env::default();
+        let value: u32 = explicit_val(&env, &ScSpecTypeDef::U32, "42")
+            .unwrap()
+            .into_val(&env);
+        assert_eq!(value, 42);
+        let bytes: soroban_sdk::Bytes = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x00a1")
+            .unwrap()
+            .into_val(&env);
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(
+            decode_hex("abc").unwrap_err().0,
+            "Bytes --arg hex must contain pairs of digits"
+        );
+    }
+
+    #[test]
+    fn binary_search_refines_to_adjacent_success_and_failure() {
+        let mut probed = Vec::new();
+        let (success, failure) = refine_upper_bound(8, 32, &mut |value| {
+            probed.push(value);
+            Ok(value <= 19)
+        })
+        .unwrap();
+        assert_eq!((success, failure), (19, 20));
+        assert!(probed.len() <= 5);
     }
 
     // ---- #245: baseline comparison ----
