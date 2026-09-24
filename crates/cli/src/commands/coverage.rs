@@ -15,6 +15,29 @@ pub enum Format {
     Html,
 }
 
+/// Parses `--fail-under` as a percentage.
+///
+/// The value is forwarded verbatim to the coverage tool as
+/// `--fail-under-lines`, so anything outside 0..=100 is either a typo (950
+/// for 95) or a misunderstanding of the flag, and either way the tool's own
+/// response to it is not something a user can act on. Rejecting it at the
+/// parse boundary means the error names the flag and the value.
+fn parse_fail_under(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a percentage; expected a number between 0 and 100"))?;
+
+    // `contains` is false for NaN, which is what we want: a NaN threshold
+    // never fails a run, so accepting it would silently disable the gate.
+    if !(0.0..=100.0).contains(&value) {
+        return Err(format!(
+            "`{raw}` is outside the valid range; --fail-under must be between 0 and 100"
+        ));
+    }
+
+    Ok(value)
+}
+
 /// Arguments for `soroban-testkit coverage`.
 #[derive(Args)]
 pub struct CoverageArgs {
@@ -22,7 +45,10 @@ pub struct CoverageArgs {
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
     /// Fail (non-zero exit) if line coverage is below this percentage.
-    #[arg(long, value_name = "PCT")]
+    ///
+    /// Must be between 0 and 100: the value is passed to the coverage tool as
+    /// `--fail-under-lines`, which has no meaning outside that range.
+    #[arg(long, value_name = "PCT", value_parser = parse_fail_under)]
     fail_under: Option<f64>,
     /// Open the HTML report after generating it (implies --format html).
     #[arg(long)]
@@ -247,6 +273,56 @@ mod tests {
                 "90",
             ]
         );
+    }
+
+    #[test]
+    fn fail_under_accepts_the_whole_percentage_range() {
+        for raw in ["0", "100", "95.5"] {
+            assert_eq!(
+                parse_fail_under(raw).unwrap(),
+                raw.parse::<f64>().unwrap(),
+                "--fail-under {raw} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn fail_under_rejects_values_outside_the_range() {
+        for raw in ["-1", "100.5", "1000", "nan", "not-a-number"] {
+            let err = parse_fail_under(raw).expect_err("value should be rejected");
+            assert!(
+                err.contains("--fail-under") || err.contains("percentage"),
+                "error should name the flag or the expected unit: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cli_itself_rejects_fail_under_outside_the_range() {
+        use clap::{Command, FromArgMatches};
+
+        // Exercise the real parser rather than the helper alone: the point of
+        // the fix is that the flag cannot reach the coverage tool at all.
+        let command = || CoverageArgs::augment_args(Command::new("coverage"));
+
+        // `--flag=value` rather than `--flag value`: a bare `-1` is read by
+        // clap as a flag of its own, so the value parser would never see it.
+        for raw in ["-1", "150", "nan"] {
+            let arg = format!("--fail-under={raw}");
+            let err = command()
+                .try_get_matches_from(["coverage", &arg])
+                .expect_err("clap should reject the value");
+            assert!(
+                err.to_string().contains("between 0 and 100"),
+                "unexpected error for {arg}: {err}"
+            );
+        }
+
+        let matches = command()
+            .try_get_matches_from(["coverage", "--fail-under", "90"])
+            .expect("a valid percentage parses");
+        let parsed = CoverageArgs::from_arg_matches(&matches).expect("matches deserialize");
+        assert_eq!(parsed.fail_under, Some(90.0));
     }
 
     #[test]

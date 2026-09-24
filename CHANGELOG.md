@@ -77,6 +77,7 @@ section, so a merge can never land without a place to record the change.
 
 ### Fixed
 
+- CLI: `--fail-under` rejects percentages outside 0–100 with an error that names the flag, instead of forwarding the value to the coverage tool.
 - `limits` never mocked authorization: every ramp attempt failed on a
   `require_auth` call before resource limits were ever reached. Each probe
   now uses `mock_all_auths_allowing_non_root_auth()` on its own
