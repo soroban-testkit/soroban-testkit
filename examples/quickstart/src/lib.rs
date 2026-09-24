@@ -119,7 +119,7 @@ impl Escrow {
 
         env.storage().instance().set(&DataKey::Settled, &true);
         soroban_sdk::token::TokenClient::new(&env, &token).transfer(
-            env.current_contract_address(),
+            &env.current_contract_address(),
             &seller,
             &amount,
         );
@@ -138,7 +138,7 @@ impl Escrow {
 
         env.storage().instance().set(&DataKey::Settled, &true);
         soroban_sdk::token::TokenClient::new(&env, &token).transfer(
-            env.current_contract_address(),
+            &env.current_contract_address(),
             &buyer,
             &amount,
         );
@@ -155,7 +155,7 @@ impl Escrow {
         // NOTE: no `buyer.require_auth()` — this is the deliberate bug.
         env.storage().instance().set(&DataKey::Settled, &true);
         soroban_sdk::token::TokenClient::new(&env, &token).transfer(
-            env.current_contract_address(),
+            &env.current_contract_address(),
             &seller,
             &amount,
         );
@@ -248,7 +248,7 @@ mod tests {
             }
         }
 
-        fn client(&self) -> EscrowClient {
+        fn client(&self) -> EscrowClient<'_> {
             EscrowClient::new(self.env.env(), &self.escrow_id)
         }
 
@@ -488,7 +488,7 @@ mod tests {
         // Single entry point: only buyer is allowed.  The matrix cross-checks
         // buyer (the only known address) and confirms it succeeds.
         AuthMatrix::new(&env)
-            .entry_point("release", &[buyer.clone()], move |caller: &Address| {
+            .entry_point("release", core::slice::from_ref(&buyer), move |caller: &Address| {
                 let escrow_id = sdk_env.register(Escrow, ());
 
                 sdk_env.mock_all_auths();

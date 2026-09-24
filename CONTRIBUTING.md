@@ -43,6 +43,42 @@ release checklist for both crates is in
 [`RELEASING.md`](RELEASING.md). The `docs` and `release` workflows in
 `.github/workflows/` enforce these on every PR and on every `v*` tag.
 
+## Minimum supported Rust version
+
+The workspace MSRV is declared once, as `rust-version` in `[workspace.package]`
+in the root `Cargo.toml`, and every member inherits it with
+`rust-version.workspace = true`. No other file should repeat the number.
+
+The current value is driven by `soroban-sdk`: 1.91.0 is what `soroban-sdk`
+27.0.6 declares for itself, and cargo refuses to build a dependency graph that
+needs a newer compiler than the one in use. That makes the MSRV a floor we
+inherit rather than one we choose — it cannot be lowered without dropping to an
+older `soroban-sdk`, and that trade-off belongs in
+[`COMPATIBILITY.md`](COMPATIBILITY.md), not in a quiet version bump here.
+
+CI enforces it in the `msrv` job: the job reads the version out of the
+manifests, installs exactly that toolchain, and runs
+`cargo check --workspace --all-targets`. It fails when members disagree, which
+is what a forgotten `rust-version.workspace = true` looks like.
+
+Developing on stable (what `rust-toolchain.toml` pins) is expected. The MSRV is
+a promise to contributors and users on older toolchains, not a restriction on
+what you may install locally.
+
+To check it by hand:
+
+```sh
+cargo +1.91.0 check --workspace --all-targets
+```
+
+Raising the MSRV is a deliberate change, not a side effect of a feature PR:
+
+1. A dependency needs it, or the workspace genuinely wants a newer language
+   feature. Say which in the PR — the compiler error is the evidence.
+2. The `msrv` job is green on the new version.
+3. `CHANGELOG.md` records it, because dropping older toolchains is the kind of
+   change people do not expect in a patch release.
+
 ## Supply-chain policy
 
 Dependencies are checked with [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/),

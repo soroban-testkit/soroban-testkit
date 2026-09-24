@@ -4,6 +4,7 @@ description = "A deliberately buggy example contract used in soroban-testkit's d
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]

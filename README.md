@@ -108,6 +108,13 @@ past that boundary. Ledger read/write counts and transaction size aren't
 reported (they come from a network-side simulated footprint this crate
 doesn't produce); instructions and memory, measured locally, are.
 
+## Requirements
+
+Rust 1.91.0 or newer — the workspace `rust-version`, inherited from
+`soroban-sdk`'s own MSRV — plus the `wasm32v1-none` target if you want the CLI's
+`limits` command to build a contract to WASM. [`CONTRIBUTING.md`](CONTRIBUTING.md#minimum-supported-rust-version)
+has the policy and how CI checks it.
+
 ## Status
 
 This crate is under active development. See `BUILD_SPEC.md` for the build

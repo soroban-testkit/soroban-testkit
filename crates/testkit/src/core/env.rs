@@ -6,6 +6,8 @@ use soroban_sdk::testutils::Address as _;
 use soroban_sdk::testutils::Ledger as _;
 use soroban_sdk::{Address, Env};
 
+use super::error::TestkitError;
+
 // ──────────────────────────────────────────────────────────────────────────
 // Issue #35 — builder for deterministic ledger defaults
 // ──────────────────────────────────────────────────────────────────────────

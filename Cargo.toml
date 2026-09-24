@@ -2,9 +2,14 @@
 resolver = "2"
 members = ["crates/*", "examples/vault", "examples/quickstart"]
 
+# MSRV is declared here and inherited by every member; CI reads it from the
+# manifests rather than from a copy in the workflow. 1.91.0 is what
+# `soroban-sdk` 27.0.6 itself requires, so the floor is inherited from the
+# dependency graph, not chosen. See CONTRIBUTING.md.
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.91.0"
 license = "Apache-2.0"
 repository = "https://github.com/soroban-testkit/soroban-testkit"
 

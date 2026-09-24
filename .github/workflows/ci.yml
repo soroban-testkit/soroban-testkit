@@ -25,6 +25,33 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  msrv:
+    name: MSRV (declared rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Read the version from the manifests instead of repeating it here, so the
+      # job and the crates cannot drift apart. It also fails when members
+      # disagree, which is what a missing `rust-version.workspace = true` looks
+      # like.
+      - name: Read rust-version from the manifests
+        id: msrv
+        run: |
+          versions=$(cargo metadata --no-deps --format-version 1 | jq -r '\
+            [.packages[].rust_version] | unique | .[]')
+          if [ "$(printf '%s\n' "$versions" | grep -c .)" != "1" ]; then
+            echo "::error::workspace members disagree on rust-version: $versions"
+            exit 1
+          fi
+          echo "rust-version=$versions" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.rust-version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --workspace --all-targets
+
   test:
     name: build + test
     runs-on: ubuntu-latest
