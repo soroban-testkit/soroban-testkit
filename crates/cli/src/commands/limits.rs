@@ -868,6 +868,59 @@ mod tests {
         assert!(err.0.contains("missing `instructions`"), "{}", err.0);
     }
 
+    /// A temporary directory that removes itself when it goes out of scope.
+    ///
+    /// The baseline tests below write real files to disk. Calling
+    /// `remove_dir_all` at the end of a test body does not run when the test
+    /// panics — and a failing test is exactly the case where the leftovers are
+    /// least wanted, since it is the one that gets run again. `Drop` runs while
+    /// the stack unwinds, so the directory goes either way.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("stk-baseline-{}-{label}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create baseline temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_temp_dir_guard_removes_the_directory_even_when_the_test_panics() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        let slot = std::sync::Arc::clone(&captured);
+        let body = std::panic::catch_unwind(move || {
+            let dir = TempDir::new("panic-cleanup");
+            *slot.lock().unwrap() = Some(dir.path().to_path_buf());
+            assert!(dir.path().exists(), "the guard should have created it");
+            panic!("fail on purpose, to prove the directory does not survive it");
+        });
+
+        assert!(body.is_err(), "the body should have panicked");
+        let path = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the path was captured before the panic");
+        assert!(
+            !path.exists(),
+            "the guard should have removed {} while unwinding",
+            path.display()
+        );
+    }
+
     #[test]
     fn baseline_parse_rejects_an_unknown_key() {
         let err = Baseline::parse("function=f\nramp=r\nbest=1\nbogus=2\n").unwrap_err();
@@ -882,9 +935,8 @@ mod tests {
 
     #[test]
     fn compare_to_baseline_passes_when_nothing_regressed() {
-        let dir = std::env::temp_dir().join(format!("stk-baseline-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pass.baseline");
+        let dir = TempDir::new("passes");
+        let path = dir.path().join("pass.baseline");
         std::fs::write(&path, sample_baseline().to_file_contents()).unwrap();
 
         let result = compare_to_baseline(
@@ -901,9 +953,8 @@ mod tests {
 
     #[test]
     fn compare_to_baseline_fails_when_the_ramp_ceiling_drops() {
-        let dir = std::env::temp_dir().join(format!("stk-baseline-{}-2", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ceiling-drop.baseline");
+        let dir = TempDir::new("ceiling-drop");
+        let path = dir.path().join("ceiling-drop.baseline");
         std::fs::write(&path, sample_baseline().to_file_contents()).unwrap();
 
         let err = compare_to_baseline(
@@ -925,9 +976,8 @@ mod tests {
 
     #[test]
     fn compare_to_baseline_fails_when_instructions_grow_past_tolerance() {
-        let dir = std::env::temp_dir().join(format!("stk-baseline-{}-3", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("instr-grow.baseline");
+        let dir = TempDir::new("instr-grow");
+        let path = dir.path().join("instr-grow.baseline");
         std::fs::write(&path, sample_baseline().to_file_contents()).unwrap();
 
         // +10% instructions, tolerance is 5%.
@@ -946,9 +996,8 @@ mod tests {
 
     #[test]
     fn compare_to_baseline_allows_growth_within_tolerance() {
-        let dir = std::env::temp_dir().join(format!("stk-baseline-{}-4", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("within-tolerance.baseline");
+        let dir = TempDir::new("within-tolerance");
+        let path = dir.path().join("within-tolerance.baseline");
         std::fs::write(&path, sample_baseline().to_file_contents()).unwrap();
 
         // +2% instructions, tolerance is 5%.
@@ -966,9 +1015,8 @@ mod tests {
 
     #[test]
     fn compare_to_baseline_rejects_a_mismatched_function_or_ramp() {
-        let dir = std::env::temp_dir().join(format!("stk-baseline-{}-5", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mismatch.baseline");
+        let dir = TempDir::new("mismatch");
+        let path = dir.path().join("mismatch.baseline");
         std::fs::write(&path, sample_baseline().to_file_contents()).unwrap();
 
         let err = compare_to_baseline(&path, "amount", "batch_payout", 100, 1_000_000, 50_000, 5.0)
