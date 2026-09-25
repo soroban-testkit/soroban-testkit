@@ -49,6 +49,11 @@ section, so a merge can never land without a place to record the change.
   `assert_bumps_ttl`, `assert_survives_expiry`).
 - TTL assertion and snapshot helpers (`assert_ttl_at_least`,
   `assert_ttl_delta`, `ttl_snapshot` with `TtlSnapshot::diff`).
+- Temporary-storage expiry recipes: `assert_temporary_expires` (the entry
+  is deleted and the contract treats it as absent instead of trapping),
+  `assert_temporary_expiry_boundary` (pins the last live ledger and the
+  first expired one), and `assert_temporary_extension_defers_expiry`
+  (an extension actually keeps the entry alive past its original expiry).
 - `soroban-testkit` CLI with `coverage`, `limits`, and `audit`
   subcommands (published as `soroban-testkit-cli`).
 - Project and release documentation: `API_STABILITY.md`,

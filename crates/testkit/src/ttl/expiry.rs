@@ -224,6 +224,61 @@ impl fmt::Display for TtlTimeline {
     }
 }
 
+/// A point-in-time reading of one entry's TTL, taken with
+/// [`TestEnv::ttl_snapshot`] and compared with [`TtlSnapshot::diff`].
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::TestEnv;
+/// use soroban_testkit::ttl::StorageKind;
+/// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+///
+/// #[contract]
+/// struct Store;
+///
+/// #[contractimpl]
+/// impl Store {
+///     pub fn set(env: Env, key: Symbol, value: i128) {
+///         env.storage().persistent().set(&key, &value);
+///     }
+/// }
+///
+/// # fn main() {
+/// let env = TestEnv::new();
+/// let id = env.env().register(Store, ());
+/// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+///
+/// let before = env.ttl_snapshot(&id, StorageKind::Persistent, symbol_short!("k"));
+/// env.advance_ledgers(10);
+/// let after = env.ttl_snapshot(&id, StorageKind::Persistent, symbol_short!("k"));
+/// assert_eq!(before.diff(&after), -10);
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtlSnapshot {
+    kind: StorageKind,
+    ttl: u32,
+}
+
+impl TtlSnapshot {
+    /// The TTL, in ledgers, at the time of the snapshot.
+    pub fn ttl(&self) -> u32 {
+        self.ttl
+    }
+
+    /// The storage kind of the entry that was snapshotted.
+    pub fn kind(&self) -> StorageKind {
+        self.kind
+    }
+
+    /// The signed change in TTL from this snapshot to `later`: positive if
+    /// the TTL grew (an extension), negative if it shrank (ledgers elapsed).
+    pub fn diff(&self, later: &TtlSnapshot) -> i64 {
+        i64::from(later.ttl) - i64::from(self.ttl)
+    }
+}
+
 impl TestEnv {
     /// Build a protocol-version fixture for archival behavior: an
     /// environment whose ledger is pinned to `protocol_version`.
@@ -511,6 +566,9 @@ impl TestEnv {
     ///
     /// #[contractimpl]
     /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
     ///     pub fn touch_both(env: Env) {
     ///         env.storage().persistent().extend_ttl(&symbol_short!("a"), 5_000, 10_000);
     ///         env.storage().persistent().extend_ttl(&symbol_short!("b"), 5_000, 10_000);
@@ -520,14 +578,17 @@ impl TestEnv {
     /// # fn main() {
     /// let env = TestEnv::new();
     /// let id = env.env().register(Store, ());
+    /// let client = StoreClient::new(env.env(), &id);
     /// let a = symbol_short!("a");
     /// let b = symbol_short!("b");
+    /// client.set(&a, &1);
+    /// client.set(&b, &2);
     ///
     /// env.assert_bumps_ttl_multi(&id, StorageKind::Persistent, &[
     ///     (a, "key_a"),
     ///     (b, "key_b"),
     /// ], || {
-    ///     StoreClient::new(env.env(), &id).touch_both();
+    ///     client.touch_both();
     /// });
     /// # }
     /// ```
@@ -893,7 +954,7 @@ impl TestEnv {
     {
         let kind = StorageKind::Persistent;
         let key_val = key.into_val(self.env());
-        let timeline = self.ttl_timeline(contract, kind, &key_val);
+        let timeline = self.ttl_timeline(contract, kind, key_val);
 
         // Cross the expiry boundary scoped to this single entry.
         self.advance_ledgers(timeline.ttl_remaining.saturating_add(1));
@@ -936,6 +997,496 @@ impl TestEnv {
                     self.sequence()
                 ))
             );
+        }
+    }
+
+    /// Assert that the entry at `contract`/`kind`/`key` has a TTL of at
+    /// least `min_ttl` ledgers right now.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the actual
+    /// and minimum TTL if the TTL is lower, and — like
+    /// [`TestEnv::ttl_of`] — if the entry does not exist or has expired.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+    ///
+    /// env.assert_ttl_at_least(&id, StorageKind::Persistent, symbol_short!("k"), 1);
+    /// # }
+    /// ```
+    pub fn assert_ttl_at_least<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+        min_ttl: u32,
+    ) {
+        let key_val = key.into_val(self.env());
+        let ttl = self.ttl_of_val(contract, kind, &key_val);
+        if ttl < min_ttl {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the {kind:?} TTL to be at least {min_ttl} ledgers, but it is {ttl}"
+                ))
+            );
+        }
+    }
+
+    /// Assert that running `f` changes the TTL of the entry at `contract`/
+    /// `kind`/`key` by exactly `expected_delta` ledgers (after minus
+    /// before).
+    ///
+    /// The delta is signed: a bump is positive, and a closure that only
+    /// advances the ledger yields a negative delta.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the before
+    /// and after TTLs and the actual delta if it differs from
+    /// `expected_delta`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
+    ///
+    /// env.assert_ttl_delta(&id, StorageKind::Persistent, symbol_short!("k"), -5, || {
+    ///     env.advance_ledgers(5);
+    /// });
+    /// # }
+    /// ```
+    pub fn assert_ttl_delta<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+        expected_delta: i64,
+        f: impl FnOnce(),
+    ) {
+        let key_val = key.into_val(self.env());
+        let before = self.ttl_of_val(contract, kind, &key_val);
+        f();
+        let after = self.ttl_of_val(contract, kind, &key_val);
+        let delta = i64::from(after) - i64::from(before);
+        if delta != expected_delta {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the call to change the {kind:?} TTL by {expected_delta} ledgers, \
+                     but it went from {before} to {after} ({delta})"
+                ))
+            );
+        }
+    }
+
+    /// Capture the current TTL of the entry at `contract`/`kind`/`key` as a
+    /// [`TtlSnapshot`], to compare against a later one with
+    /// [`TtlSnapshot::diff`].
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`TestEnv::ttl_of`].
+    ///
+    /// # Example
+    ///
+    /// See [`TtlSnapshot`].
+    pub fn ttl_snapshot<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+    ) -> TtlSnapshot {
+        TtlSnapshot {
+            kind,
+            ttl: self.ttl_of(contract, kind, key),
+        }
+    }
+
+    /// The temporary-storage expiry recipe: drive a temporary entry past
+    /// its expiry boundary, verify it is really gone, and verify the
+    /// contract handles its absence — producing `expected` rather than
+    /// trapping.
+    ///
+    /// This is the temporary-storage counterpart of
+    /// [`assert_recovers_after_expiry`](Self::assert_recovers_after_expiry).
+    /// A persistent entry is archived and comes back on its next read; a
+    /// temporary entry is deleted, so the only correct contract behavior is
+    /// to treat it as absent (typically `unwrap_or(default)` or an explicit
+    /// "expired" error). The recipe runs in three steps, each checked:
+    ///
+    /// 1. The entry's [`TtlTimeline`] is captured while the entry is live.
+    /// 2. The ledger is advanced to exactly one ledger after its last live
+    ///    ledger, and the entry is checked to be absent from temporary
+    ///    storage.
+    /// 3. `f` runs and returns what the contract observed; it must not
+    ///    panic, and its result is compared against `expected`.
+    ///
+    /// Only this one entry is pushed past its boundary (the minimum
+    /// advance), so entries with more TTL headroom stay live.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] naming the stage that
+    /// failed: the entry still being present after its boundary, `f`
+    /// panicking on the missing entry, or `f` producing something other
+    /// than `expected`. Also panics (via the underlying SDK) if the entry
+    /// does not exist or has already expired before the recipe runs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Session;
+    ///
+    /// #[contractimpl]
+    /// impl Session {
+    ///     pub fn open(env: Env, key: Symbol, nonce: u32) {
+    ///         env.storage().temporary().set(&key, &nonce);
+    ///     }
+    ///     pub fn nonce(env: Env, key: Symbol) -> u32 {
+    ///         env.storage().temporary().get(&key).unwrap_or(0)
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Session, ());
+    /// let client = SessionClient::new(env.env(), &id);
+    /// client.open(&symbol_short!("s"), &7);
+    ///
+    /// // Once expired, the session is gone and the contract falls back to 0.
+    /// env.assert_temporary_expires(&id, symbol_short!("s"), || {
+    ///     client.nonce(&symbol_short!("s"))
+    /// }, 0);
+    /// # }
+    /// ```
+    pub fn assert_temporary_expires<K, V>(
+        &self,
+        contract: &Address,
+        key: K,
+        f: impl FnOnce() -> V,
+        expected: V,
+    ) where
+        K: IntoVal<Env, Val>,
+        V: PartialEq + fmt::Debug,
+    {
+        let key_val = key.into_val(self.env());
+        let timeline = self.ttl_timeline(contract, StorageKind::Temporary, key_val);
+
+        // `ttl_remaining` is the number of ledgers the entry stays live
+        // *after* this one, so one more ledger than that crosses the
+        // boundary.
+        self.advance_ledgers(timeline.ttl_remaining.saturating_add(1));
+
+        if self.temporary_entry_exists(contract, &key_val) {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the Temporary entry to be deleted after expiry, but it is still \
+                     present at ledger {} (it was live until ledger {})",
+                    self.sequence(),
+                    timeline.expires_at_sequence
+                ))
+            );
+        }
+
+        let observed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(observed) => observed,
+            Err(payload) => panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the contract to treat the expired Temporary entry as absent, but it \
+                     panicked at ledger {} (the entry was live until ledger {}): {}",
+                    self.sequence(),
+                    timeline.expires_at_sequence,
+                    panic_message(&payload)
+                ))
+            ),
+        };
+        if observed != expected {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the contract to observe {expected:?} once the Temporary entry \
+                     expired, but it observed {observed:?} at ledger {} (the entry was live until \
+                     ledger {})",
+                    self.sequence(),
+                    timeline.expires_at_sequence
+                ))
+            );
+        }
+    }
+
+    /// Pin down both sides of a temporary entry's expiry boundary: `f` must
+    /// observe `live` on the entry's last live ledger and `expired` on the
+    /// very next one.
+    ///
+    /// Off-by-one errors around expiry are the classic temporary-storage
+    /// bug — a session, nonce or rate-limit window that dies a ledger early
+    /// or survives a ledger late. This recipe runs `f` exactly on the
+    /// boundary:
+    ///
+    /// 1. The ledger is advanced to the entry's last live ledger (where
+    ///    [`TestEnv::ttl_of`] reports `0`). The entry must still be present,
+    ///    and `f` must return `live`.
+    /// 2. The ledger is advanced by one. The entry must be gone, and `f`
+    ///    must return `expired`.
+    ///
+    /// `f` must not extend the entry's TTL: if it does, the entry is still
+    /// present in step 2 and the recipe says so rather than silently
+    /// testing a different boundary. Use
+    /// [`assert_temporary_extension_defers_expiry`](Self::assert_temporary_extension_defers_expiry)
+    /// to test extension instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] naming the side of
+    /// the boundary that failed and the ledger it failed at, if the entry's
+    /// presence or `f`'s result is wrong on either side, or if `f` panics.
+    /// Also panics (via the underlying SDK) if the entry does not exist or
+    /// has already expired before the recipe runs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Session;
+    ///
+    /// #[contractimpl]
+    /// impl Session {
+    ///     pub fn open(env: Env, key: Symbol) {
+    ///         env.storage().temporary().set(&key, &true);
+    ///     }
+    ///     pub fn is_open(env: Env, key: Symbol) -> bool {
+    ///         env.storage().temporary().get(&key).unwrap_or(false)
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Session, ());
+    /// let client = SessionClient::new(env.env(), &id);
+    /// client.open(&symbol_short!("s"));
+    ///
+    /// env.assert_temporary_expiry_boundary(
+    ///     &id,
+    ///     symbol_short!("s"),
+    ///     || client.is_open(&symbol_short!("s")),
+    ///     true,
+    ///     false,
+    /// );
+    /// # }
+    /// ```
+    pub fn assert_temporary_expiry_boundary<K, V>(
+        &self,
+        contract: &Address,
+        key: K,
+        mut f: impl FnMut() -> V,
+        live: V,
+        expired: V,
+    ) where
+        K: IntoVal<Env, Val>,
+        V: PartialEq + fmt::Debug,
+    {
+        let key_val = key.into_val(self.env());
+        let timeline = self.ttl_timeline(contract, StorageKind::Temporary, key_val);
+        let last_live = timeline.expires_at_sequence;
+
+        self.advance_ledgers(timeline.ttl_remaining);
+        if !self.temporary_entry_exists(contract, &key_val) {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the Temporary entry to still be present on its last live ledger \
+                     {last_live}, but it was already gone"
+                ))
+            );
+        }
+        let observed =
+            self.run_temporary_recipe_step(&mut f, "on the Temporary entry's last live ledger");
+        if observed != live {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the contract to observe {live:?} on the Temporary entry's last live \
+                     ledger {last_live}, but it observed {observed:?}"
+                ))
+            );
+        }
+
+        self.advance_ledgers(1);
+        if self.temporary_entry_exists(contract, &key_val) {
+            let ttl = self.ttl_of_val(contract, StorageKind::Temporary, &key_val);
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the Temporary entry to be deleted at ledger {}, one past its last \
+                     live ledger {last_live}, but it is still present with TTL {ttl} — did the \
+                     closure extend it?",
+                    self.sequence()
+                ))
+            );
+        }
+        let observed =
+            self.run_temporary_recipe_step(&mut f, "one ledger after the Temporary entry expired");
+        if observed != expired {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the contract to observe {expired:?} at ledger {}, one past the \
+                     Temporary entry's last live ledger {last_live}, but it observed {observed:?}",
+                    self.sequence()
+                ))
+            );
+        }
+    }
+
+    /// Assert that running `extend` pushes a temporary entry's expiry past
+    /// its original boundary: after `extend`, the entry is still present
+    /// one ledger after the ledger it would otherwise have been deleted on.
+    ///
+    /// This is the recipe for contracts that keep short-lived state alive
+    /// while it is in use — a session renewed on activity, a lock
+    /// refreshed by its holder. [`assert_bumps_ttl`](Self::assert_bumps_ttl)
+    /// only proves the TTL number went up; this proves the entry actually
+    /// survives the ledger that would have killed it.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the original
+    /// and new last live ledgers if the entry is gone one ledger past its
+    /// original boundary, or if `extend` panics. Also panics (via the
+    /// underlying SDK) if the entry does not exist or has already expired
+    /// before the recipe runs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Session;
+    ///
+    /// #[contractimpl]
+    /// impl Session {
+    ///     pub fn open(env: Env, key: Symbol) {
+    ///         env.storage().temporary().set(&key, &true);
+    ///     }
+    ///     pub fn renew(env: Env, key: Symbol) {
+    ///         env.storage().temporary().extend_ttl(&key, 100, 100);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Session, ());
+    /// let client = SessionClient::new(env.env(), &id);
+    /// client.open(&symbol_short!("s"));
+    ///
+    /// env.assert_temporary_extension_defers_expiry(&id, symbol_short!("s"), || {
+    ///     client.renew(&symbol_short!("s"));
+    /// });
+    /// # }
+    /// ```
+    pub fn assert_temporary_extension_defers_expiry<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        key: K,
+        extend: impl FnOnce(),
+    ) {
+        let key_val = key.into_val(self.env());
+        let original = self.ttl_timeline(contract, StorageKind::Temporary, key_val);
+
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(extend)) {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "closure panicked while extending the Temporary entry: {}",
+                    panic_message(&payload)
+                ))
+            );
+        }
+        let extended = self.ttl_timeline(contract, StorageKind::Temporary, key_val);
+
+        // One ledger past the original last live ledger: an unextended
+        // entry is deleted here.
+        self.advance_ledgers(original.ttl_remaining.saturating_add(1));
+        if !self.temporary_entry_exists(contract, &key_val) {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected extending the Temporary entry to keep it alive past its original \
+                     last live ledger {}, but it was gone at ledger {} (after the closure it was \
+                     live until ledger {})",
+                    original.expires_at_sequence,
+                    self.sequence(),
+                    extended.expires_at_sequence
+                ))
+            );
+        }
+    }
+
+    fn temporary_entry_exists(&self, contract: &Address, key_val: &Val) -> bool {
+        self.env()
+            .as_contract(contract, || self.env().storage().temporary().has(key_val))
+    }
+
+    fn run_temporary_recipe_step<V>(&self, f: &mut impl FnMut() -> V, when: &str) -> V {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(observed) => observed,
+            Err(payload) => panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "closure panicked when run {when}, at ledger {}: {}",
+                    self.sequence(),
+                    panic_message(&payload)
+                ))
+            ),
         }
     }
 
@@ -1421,5 +1972,209 @@ mod tests {
         });
 
         env.assert_recovers_after_expiry(&id, DataKey::Record, || client.touch_record_checked(), 9);
+    }
+
+    fn extend_temp(env: &TestEnv, id: &Address) {
+        env.env().as_contract(id, || {
+            env.env()
+                .storage()
+                .temporary()
+                .extend_ttl(&DataKey::Temp, 100, 100)
+        });
+    }
+
+    #[test]
+    fn assert_temporary_expires_passes_when_the_contract_treats_it_as_absent() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_expires(&id, DataKey::Temp, || client.read_temp_checked(), 0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "expected the contract to treat the expired Temporary entry as absent"
+    )]
+    fn assert_temporary_expires_fails_when_the_contract_traps() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_expires(&id, DataKey::Temp, || client.read_temp_unchecked(), 0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "expected the contract to observe 42 once the Temporary entry expired"
+    )]
+    fn assert_temporary_expires_fails_when_the_value_is_expected_to_survive() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        // Unlike persistent storage, a read does not bring temporary data back.
+        env.assert_temporary_expires(&id, DataKey::Temp, || client.read_temp_checked(), 42);
+    }
+
+    #[test]
+    fn assert_temporary_expires_only_advances_past_the_named_entry() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+        client.set_temp(&42);
+
+        let record_before = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        let temp_ttl = env.ttl_of(&id, StorageKind::Temporary, DataKey::Temp);
+        env.assert_temporary_expires(&id, DataKey::Temp, || client.read_temp_checked(), 0);
+
+        // The persistent sibling aged by exactly the minimum advance.
+        let record_after = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        assert_eq!(record_before - record_after, temp_ttl + 1);
+    }
+
+    #[test]
+    fn assert_temporary_expires_leaves_the_key_free_to_be_rewritten() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_expires(&id, DataKey::Temp, || client.read_temp_checked(), 0);
+
+        client.set_temp(&7);
+        assert!(env.ttl_of(&id, StorageKind::Temporary, DataKey::Temp) > 0);
+        assert_eq!(client.read_temp_checked(), 7);
+    }
+
+    #[test]
+    fn assert_temporary_expiry_boundary_passes_on_both_sides() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_expiry_boundary(
+            &id,
+            DataKey::Temp,
+            || client.read_temp_checked(),
+            42,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "on the Temporary entry's last live ledger")]
+    fn assert_temporary_expiry_boundary_fails_when_the_live_value_is_wrong() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_expiry_boundary(
+            &id,
+            DataKey::Temp,
+            || client.read_temp_checked(),
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "did the closure extend it?")]
+    fn assert_temporary_expiry_boundary_fails_when_the_closure_extends_the_entry() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_expiry_boundary(
+            &id,
+            DataKey::Temp,
+            || {
+                extend_temp(&env, &id);
+                client.read_temp_checked()
+            },
+            42,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "closure panicked when run one ledger after the Temporary entry expired"
+    )]
+    fn assert_temporary_expiry_boundary_forwards_a_panic_after_expiry() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_expiry_boundary(
+            &id,
+            DataKey::Temp,
+            || client.read_temp_unchecked(),
+            42,
+            0,
+        );
+    }
+
+    #[test]
+    fn assert_temporary_extension_defers_expiry_passes_when_extended() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_extension_defers_expiry(&id, DataKey::Temp, || {
+            extend_temp(&env, &id);
+        });
+        assert_eq!(client.read_temp_checked(), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected extending the Temporary entry to keep it alive")]
+    fn assert_temporary_extension_defers_expiry_fails_without_an_extension() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_extension_defers_expiry(&id, DataKey::Temp, || {
+            let _ = client.read_temp_checked();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "closure panicked while extending the Temporary entry")]
+    fn assert_temporary_extension_defers_expiry_forwards_a_panic() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&42);
+
+        env.assert_temporary_extension_defers_expiry(&id, DataKey::Temp, || {
+            panic!("intentional test panic");
+        });
+    }
+
+    #[test]
+    fn temporary_expiry_recipes_hold_at_the_soroban_launch_protocol() {
+        let env = TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH);
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&3);
+
+        env.assert_temporary_expiry_boundary(
+            &id,
+            DataKey::Temp,
+            || client.read_temp_checked(),
+            3,
+            0,
+        );
     }
 }
