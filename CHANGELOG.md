@@ -47,6 +47,8 @@ section, so a merge can never land without a place to record the change.
   callers, reporting a pass/fail grid per caller.
 - TTL inspection and expiry simulation (`ttl_of`, `expire`,
   `assert_bumps_ttl`, `assert_survives_expiry`).
+- TTL assertion and snapshot helpers (`assert_ttl_at_least`,
+  `assert_ttl_delta`, `ttl_snapshot` with `TtlSnapshot::diff`).
 - `soroban-testkit` CLI with `coverage`, `limits`, and `audit`
   subcommands (published as `soroban-testkit-cli`).
 - Project and release documentation: `API_STABILITY.md`,

@@ -1091,6 +1091,80 @@ mod tests {
     }
 
     #[test]
+    fn assert_ttl_at_least_passes_when_ttl_meets_minimum() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let ttl = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        env.assert_ttl_at_least(&id, StorageKind::Persistent, DataKey::Record, ttl);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the Persistent TTL to be at least")]
+    fn assert_ttl_at_least_fails_when_ttl_is_below_minimum() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let ttl = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        env.assert_ttl_at_least(&id, StorageKind::Persistent, DataKey::Record, ttl + 1);
+    }
+
+    #[test]
+    fn assert_ttl_delta_passes_on_exact_delta() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_ttl_delta(&id, StorageKind::Persistent, DataKey::Record, -10, || {
+            env.advance_ledgers(10);
+        });
+        env.assert_ttl_delta(&id, StorageKind::Persistent, DataKey::Record, 0, || {
+            client.touch_record();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the call to change the Persistent TTL by 5 ledgers")]
+    fn assert_ttl_delta_fails_on_a_different_delta() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_ttl_delta(&id, StorageKind::Persistent, DataKey::Record, 5, || {
+            client.touch_record(); // reads without bumping
+        });
+    }
+
+    #[test]
+    fn ttl_snapshot_diff_reports_signed_change() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let before = env.ttl_snapshot(&id, StorageKind::Persistent, DataKey::Record);
+        env.advance_ledgers(10);
+        let aged = env.ttl_snapshot(&id, StorageKind::Persistent, DataKey::Record);
+        client.touch_record_checked();
+        let bumped = env.ttl_snapshot(&id, StorageKind::Persistent, DataKey::Record);
+
+        assert_eq!(before.kind(), StorageKind::Persistent);
+        assert_eq!(before.diff(&aged), -10);
+        assert_eq!(before.diff(&before), 0);
+        assert_eq!(
+            aged.diff(&bumped),
+            i64::from(bumped.ttl()) - i64::from(aged.ttl())
+        );
+        assert!(aged.diff(&bumped) > 0);
+    }
+
+    #[test]
     fn assert_runs_before_expiry_runs_closure() {
         let env = TestEnv::new();
         let id = env.env().register(Vault, ());
