@@ -9,13 +9,17 @@
 //! execution on either side of the expiry boundary
 //! ([`TestEnv::assert_runs_before_expiry`] / [`TestEnv::assert_runs_after_expiry`]),
 //! a full [`TtlTimeline`] report per entry, persistent-storage recovery
-//! recipes ([`TestEnv::assert_recovers_after_expiry`]), and protocol-version
+//! recipes ([`TestEnv::assert_recovers_after_expiry`]), temporary-storage
+//! expiry recipes ([`TestEnv::assert_temporary_expires`],
+//! [`TestEnv::assert_temporary_expiry_boundary`] and
+//! [`TestEnv::assert_temporary_extension_defers_expiry`]), and protocol-version
 //! fixtures for archival behavior ([`TestEnv::with_protocol_version`] and
 //! [`ArchivalParameters`]).
 
 mod expiry;
 
 pub use expiry::{
-    ArchivalParameters, StorageKind, TtlTimeline, ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE,
-    ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH, ARCHIVAL_PROTOCOL_STATE_ARCHIVAL,
+    ArchivalParameters, StorageKind, TtlSnapshot, TtlTimeline,
+    ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE, ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH,
+    ARCHIVAL_PROTOCOL_STATE_ARCHIVAL,
 };
