@@ -1,10 +1,13 @@
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use soroban_sdk::testutils::Address as _;
 use soroban_sdk::testutils::Ledger as _;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::xdr::{ContractId, Hash, ScAddress};
+use soroban_sdk::{Address, Env, TryFromVal};
 
 use super::error::TestkitError;
 
@@ -220,14 +223,32 @@ impl fmt::Display for EnvMetadata {
     }
 }
 
+#[derive(Default)]
+struct LabelStore {
+    address_to_label: Vec<(Address, String)>,
+    label_to_address: HashMap<String, Address>,
+}
+
 /// A wrapper around [`soroban_sdk::Env`] that carries testkit state
-/// (clock position, captured events, registered tokens) alongside the raw
-/// SDK environment.
+/// (clock position, captured events, registered tokens, address labels) alongside
+/// the raw SDK environment.
 ///
 /// Every other module in this crate extends `TestEnv` with additional
 /// methods (ledger control, event capture, token doubles, and so on) rather
 /// than introducing separate handle types, so a single `TestEnv` is enough
 /// to drive an entire test.
+///
+/// # Generated Address Labels
+///
+/// Generated addresses in `TestEnv` can optionally have human-readable labels:
+///
+/// - **When a label is provided** (via [`TestEnv::address_with_label`] or [`TestEnv::address_labeled`]):
+///   The generated address is associated with the given label string. The label can be inspected
+///   using [`TestEnv::label_of`], and the address can be looked up by label using [`TestEnv::address_for_label`].
+/// - **When no label is provided** (via [`TestEnv::address`]): Address generation behavior is
+///   unchanged; a fresh random address is generated without any associated label.
+/// - **Label exposure**: Labels are represented as string slices (`&str`) / owned strings (`String`)
+///   and exposed via [`TestEnv::label_of`] and [`TestEnv::address_for_label`].
 ///
 /// # Example
 ///
@@ -235,9 +256,11 @@ impl fmt::Display for EnvMetadata {
 /// use soroban_testkit::core::TestEnv;
 ///
 /// let env = TestEnv::new();
-/// let alice = env.address();
+/// let alice = env.address_with_label("alice");
 /// let bob = env.address();
 /// assert_ne!(alice, bob);
+/// assert_eq!(env.label_of(&alice), Some("alice".to_string()));
+/// assert_eq!(env.label_of(&bob), None);
 /// ```
 pub struct TestEnv {
     env: Env,
@@ -250,10 +273,82 @@ pub struct TestEnv {
     close_interval_secs: Option<u64>,
     // Deterministic starting ledger parameters provided via LedgerDefaults.
     ledger_defaults: LedgerDefaults,
+    // Issue #24 — the position of this environment's own address stream.
+    // Keeping the counter here (rather than drawing from the SDK's shared
+    // testutils generator) means raw handles obtained through `env()` can
+    // never shift the sequence `TestEnv::address()` issues from.
+    address_counter: Cell<u64>,
+    labels: Mutex<LabelStore>,
+}
+
+/// Reusable test setup built around a [`TestEnv`].
+///
+/// Implement this trait for a fixture struct that owns a `TestEnv` plus the
+/// addresses, contracts, or tokens a group of tests share. The provided
+/// constructors keep environment creation consistent and make seeded fixtures
+/// reproducible without duplicating setup boilerplate.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::{TestEnv, TestFixture};
+/// use soroban_sdk::Address;
+///
+/// struct Fixture {
+///     env: TestEnv,
+///     alice: Address,
+/// }
+///
+/// impl TestFixture for Fixture {
+///     fn from_env(env: TestEnv) -> Self {
+///         let alice = env.address();
+///         Self { env, alice }
+///     }
+///
+///     fn test_env(&self) -> &TestEnv {
+///         &self.env
+///     }
+/// }
+///
+/// let a = Fixture::with_seed(7);
+/// let b = Fixture::with_seed(7);
+/// assert_eq!(a.alice, b.alice);
+/// ```
+pub trait TestFixture: Sized {
+    /// Build the fixture from an already-created test environment.
+    fn from_env(env: TestEnv) -> Self;
+
+    /// Borrow the environment owned by this fixture.
+    fn test_env(&self) -> &TestEnv;
+
+    /// Build the fixture around a fresh [`TestEnv`].
+    fn new() -> Self {
+        Self::from_env(TestEnv::new())
+    }
+
+    /// Build the fixture around a reproducibly seeded [`TestEnv`].
+    fn with_seed(seed: u64) -> Self {
+        Self::from_env(TestEnv::with_seed(seed))
+    }
+}
+
+impl TestFixture for TestEnv {
+    fn from_env(env: TestEnv) -> Self {
+        env
+    }
+
+    fn test_env(&self) -> &TestEnv {
+        self
+    }
 }
 
 impl TestEnv {
     /// Create a fresh environment with a deterministic starting ledger.
+    ///
+    /// Every `TestEnv` starts at ledger sequence `0` and Unix timestamp `0`.
+    /// These values are set explicitly rather than inherited from the SDK's
+    /// defaults so tests can rely on them across SDK upgrades. Other ledger
+    /// parameters continue to come from the current Soroban SDK test config.
     ///
     /// Uses a non-reproducible seed for any future randomized value
     /// generation; use [`TestEnv::with_seed`] when a test needs to be
@@ -293,6 +388,8 @@ impl TestEnv {
             seed,
             close_interval_secs: None,
             ledger_defaults: LedgerDefaults::default(),
+            address_counter: Cell::new(0),
+            labels: Mutex::new(LabelStore::default()),
         }
     }
 
@@ -322,6 +419,8 @@ impl TestEnv {
             seed: random_seed(),
             close_interval_secs: None,
             ledger_defaults: defaults,
+            address_counter: Cell::new(0),
+            labels: Mutex::new(LabelStore::default()),
         }
     }
 
@@ -350,6 +449,8 @@ impl TestEnv {
             seed,
             close_interval_secs: None,
             ledger_defaults: defaults,
+            address_counter: Cell::new(0),
+            labels: Mutex::new(LabelStore::default()),
         }
     }
 
@@ -363,7 +464,7 @@ impl TestEnv {
     /// |---|---|
     /// | the RNG seed ([`TestEnv::with_seed`]) | the ledger clock position (`now`, `sequence`) |
     /// | the ledger close interval, if one was set ([`TestEnv::with_ledger_close_interval`]) | deployed contracts and their storage |
-    /// | | addresses, clients, and any other value created from this environment |
+    /// | | addresses, labels, clients, and any other value created from this environment |
     /// | | ledger settings changed directly through [`TestEnv::env`] |
     ///
     /// An environment that never set a close interval stays that way: the
@@ -404,6 +505,8 @@ impl TestEnv {
             seed: self.seed,
             close_interval_secs: self.close_interval_secs,
             ledger_defaults: self.ledger_defaults.clone(),
+            address_counter: Cell::new(0),
+            labels: Mutex::new(LabelStore::default()),
         }
     }
 
@@ -448,6 +551,11 @@ impl TestEnv {
     /// ```
     pub fn reset(&mut self) {
         self.env = Self::fresh_env_with_defaults(&self.ledger_defaults);
+        self.address_counter.set(0);
+        if let Ok(store) = self.labels.get_mut() {
+            store.address_to_label.clear();
+            store.label_to_address.clear();
+        }
     }
 
     /// Build the raw SDK environment every `TestEnv` starts from. Shared by
@@ -457,48 +565,88 @@ impl TestEnv {
         let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
             capture_snapshot_at_drop: false,
         });
-        // Apply any LedgerDefaults overrides so the starting ledger is
-        // deterministic. We only mutate the fields the caller specified;
-        // unset fields keep the SDK's own defaults.
-        if defaults.timestamp.is_some()
-            || defaults.sequence_number.is_some()
-            || defaults.protocol_version.is_some()
-            || defaults.base_reserve.is_some()
-        {
-            let mut info = env.ledger().get();
-            if let Some(ts) = defaults.timestamp {
-                info.timestamp = ts;
-            }
-            if let Some(seq) = defaults.sequence_number {
-                info.sequence_number = seq;
-            }
-            if let Some(pv) = defaults.protocol_version {
-                info.protocol_version = pv;
-            }
-            if let Some(br) = defaults.base_reserve {
-                info.base_reserve = br;
-            }
-            env.ledger().set(info);
+        let mut info = env.ledger().get();
+        info.sequence_number = defaults.sequence_number.unwrap_or(0);
+        info.timestamp = defaults.timestamp.unwrap_or(0);
+        if let Some(pv) = defaults.protocol_version {
+            info.protocol_version = pv;
         }
+        if let Some(br) = defaults.base_reserve {
+            info.base_reserve = br;
+        }
+        env.ledger().set(info);
         env
     }
 
     /// Escape hatch to the underlying SDK environment, for calls this crate
     /// does not wrap.
     ///
+    /// # Ownership and lifetime
+    ///
+    /// [`TestEnv`] owns the [`Env`]; `env()` only lends you a shared
+    /// reference to it:
+    ///
+    /// * The returned `&Env` is tied to the lifetime of the borrow of
+    ///   `self`, so it cannot outlive the `TestEnv` it came from.
+    /// * While that reference is alive the `TestEnv` stays borrowed, so
+    ///   [`TestEnv::reset`] (which takes `&mut self`) will not compile —
+    ///   the borrow checker enforces this at the call site rather than
+    ///   allowing a later use of stale state.
+    ///
+    /// The reference *aliases* the environment `TestEnv` uses; it is not a
+    /// copy. Mutations made through it (for example
+    /// `env().ledger().set(..)`) are immediately visible through the
+    /// `TestEnv`, and vice versa. Cloning the handle (`env().clone()`)
+    /// produces a second handle to that *same* underlying host — contract
+    /// storage and other state remain shared, so a clone is not an
+    /// independent environment. For an isolated environment that keeps only
+    /// the configuration, use [`TestEnv::clone_config`] instead.
+    ///
+    /// Addresses issued by [`TestEnv::address`] and its batch helpers come
+    /// from the stream the `TestEnv` owns, so drawing from the SDK's own
+    /// testutils generator through a raw handle (for example with
+    /// `Address::generate(env.env())`) never shifts that sequence. The two
+    /// streams are not coordinated with each other, so prefer
+    /// [`TestEnv::address`] for test participants.
+    ///
+    /// Cloned handles obtained before a [`TestEnv::reset`] keep observing
+    /// the discarded environment; re-fetch `env()` after resetting.
+    ///
     /// # Example
     ///
     /// ```
     /// use soroban_testkit::core::TestEnv;
+    /// use soroban_sdk::testutils::Ledger;
     ///
     /// let env = TestEnv::new();
     /// let _sdk_env: &soroban_sdk::Env = env.env();
+    ///
+    /// // The escape hatch aliases the environment TestEnv owns.
+    /// env.env().ledger().set_sequence_number(1_000);
+    /// assert_eq!(env.sequence(), 1_000);
     /// ```
     pub fn env(&self) -> &Env {
         &self.env
     }
 
-    /// Generate a fresh random address.
+    /// Generate a fresh address from this environment's own stream.
+    ///
+    /// Addresses are issued from a counter the `TestEnv` owns, not from the
+    /// SDK's shared testutils generator. The sequence therefore depends
+    /// only on this environment's seed and on how many addresses it has
+    /// issued: two environments built with the same seed issue identical
+    /// sequences, independently built environments' sequences are distinct
+    /// (their seeds differ), and the sequence is not shifted by activity on
+    /// the raw [`Env`] reached through [`TestEnv::env`] (raw
+    /// `Address::generate` calls, contract registration, and similar
+    /// SDK-side draws use a separate generator).
+    /// The stream's values are disjoint from that generator's namespace, so
+    /// generated addresses never collide with registered contract ids or
+    /// raw generated addresses. [`TestEnv::reset`] starts the stream over.
+    ///
+    /// This variant carries no label ([`TestEnv::label_of`] returns
+    /// `None`); use [`TestEnv::address_with_label`] for a labeled address.
+    /// Labeled addresses draw from the same stream.
     ///
     /// # Example
     ///
@@ -509,12 +657,179 @@ impl TestEnv {
     /// let alice = env.address();
     /// let bob = env.address();
     /// assert_ne!(alice, bob);
+    /// assert_eq!(env.label_of(&alice), None);
     /// ```
     pub fn address(&self) -> Address {
-        Address::generate(&self.env)
+        let next = match self.address_counter.get().checked_add(1) {
+            Some(next) => next,
+            None => panic!(
+                "{}",
+                TestkitError::misuse(
+                    "address counter exhausted: this TestEnv has already issued u64::MAX addresses"
+                )
+            ),
+        };
+        self.address_counter.set(next);
+        // Bytes 0..8 carry this environment's seed and bytes 8..16 the
+        // stream position: the layout stays disjoint from the SDK
+        // generator's namespace (trailing bytes, so `env.address() #1` can
+        // never equal the first registered contract's id), while the seed
+        // keeps independent environments' sequences distinct (issue #26)
+        // and same-seed environments reproducible.
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&self.seed.to_be_bytes());
+        bytes[8..16].copy_from_slice(&next.to_be_bytes());
+        Address::try_from_val(&self.env, &ScAddress::Contract(ContractId(Hash(bytes))))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}",
+                    TestkitError::misuse(format!("failed to construct a generated address: {e:?}"))
+                )
+            })
+    }
+
+    /// Generate a fresh random address associated with an optional human-readable label.
+    ///
+    /// # User-facing behavior
+    ///
+    /// - **When a label is provided**: Generates a fresh address, registers the label
+    ///   association in this environment, and returns the address. The label can
+    ///   subsequently be retrieved via [`TestEnv::label_of`], and the address can be
+    ///   looked up via [`TestEnv::address_for_label`].
+    /// - **When no label is provided** (via [`TestEnv::address`]): Existing address
+    ///   generation behavior is preserved; the address is generated without any label.
+    /// - **Label exposure**: Labels are represented as `&str` / `String` values and exposed
+    ///   via [`TestEnv::label_of`] and [`TestEnv::address_for_label`].
+    ///
+    /// # Error behavior
+    ///
+    /// Panics with a [`TestkitError::Misuse`] if:
+    /// - `label` is empty or consists entirely of whitespace.
+    /// - `label` is already associated with an address in this environment.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let alice = env.address_with_label("alice");
+    /// assert_eq!(env.label_of(&alice), Some("alice".to_string()));
+    /// assert_eq!(env.address_for_label("alice"), Some(alice));
+    /// ```
+    pub fn address_with_label(&self, label: &str) -> Address {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            panic!(
+                "{}",
+                TestkitError::Misuse(
+                    "address label cannot be empty or whitespace-only".to_string()
+                )
+            );
+        }
+
+        let mut store = self
+            .labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if store.label_to_address.contains_key(label) {
+            panic!(
+                "{}",
+                TestkitError::Misuse(format!("address label '{label}' is already in use"))
+            );
+        }
+
+        let addr = self.address();
+        store
+            .address_to_label
+            .push((addr.clone(), label.to_string()));
+        store
+            .label_to_address
+            .insert(label.to_string(), addr.clone());
+        addr
+    }
+
+    /// Alias for [`TestEnv::address_with_label`].
+    pub fn address_labeled(&self, label: &str) -> Address {
+        self.address_with_label(label)
+    }
+
+    /// Get the human-readable label associated with an address, if any.
+    ///
+    /// Returns `Some(label)` if the address was generated with a label (e.g., via
+    /// [`TestEnv::address_with_label`]), or `None` if the address has no label.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let alice = env.address_with_label("alice");
+    /// let bob = env.address();
+    ///
+    /// assert_eq!(env.label_of(&alice), Some("alice".to_string()));
+    /// assert_eq!(env.label_of(&bob), None);
+    /// ```
+    pub fn label_of(&self, address: &Address) -> Option<String> {
+        let store = self
+            .labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store
+            .address_to_label
+            .iter()
+            .find(|(a, _)| a == address)
+            .map(|(_, l)| l.clone())
+    }
+
+    /// Alias for [`TestEnv::label_of`].
+    pub fn label(&self, address: &Address) -> Option<String> {
+        self.label_of(address)
+    }
+
+    /// Look up a generated address by its human-readable label, if any.
+    ///
+    /// Returns `Some(address)` if an address was generated with `label`, or `None`
+    /// if no address in this environment has that label.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let alice = env.address_with_label("alice");
+    /// assert_eq!(env.address_for_label("alice"), Some(alice));
+    /// assert_eq!(env.address_for_label("unknown"), None);
+    /// ```
+    pub fn address_for_label(&self, label: &str) -> Option<Address> {
+        let store = self
+            .labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.label_to_address.get(label).cloned()
+    }
+
+    /// Alias for [`TestEnv::address_for_label`].
+    pub fn address_by_label(&self, label: &str) -> Option<Address> {
+        self.address_for_label(label)
     }
 
     /// Generate `n` fresh addresses.
+    ///
+    /// This is the panicking counterpart of [`TestEnv::try_addresses`]:
+    /// batch sizes the checked API rejects (zero, or larger than
+    /// [`MAX_ADDRESS_BATCH_SIZE`]) are rejected here with a
+    /// [`TestkitError::Misuse`] panic *before* any allocation is attempted,
+    /// so an oversized request fails with a clear message instead of
+    /// exhausting memory or exceeding what an SDK collection could hold.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::Misuse`] if `n == 0` or if
+    /// `n > MAX_ADDRESS_BATCH_SIZE`.
     ///
     /// # Example
     ///
@@ -526,7 +841,7 @@ impl TestEnv {
     /// assert_eq!(addrs.len(), 3);
     /// ```
     pub fn addresses(&self, n: usize) -> Vec<Address> {
-        (0..n).map(|_| self.address()).collect()
+        self.try_addresses(n).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Return an infinite iterator yielding fresh, distinct [`Address`] values.
@@ -591,7 +906,7 @@ impl TestEnv {
                 "requested address batch size {n} exceeds the maximum limit of {MAX_ADDRESS_BATCH_SIZE}"
             )));
         }
-        Ok(self.addresses(n))
+        Ok((0..n).map(|_| self.address()).collect())
     }
 
     /// Checked variant of address batch generation, equivalent to [`TestEnv::try_addresses`].
@@ -859,6 +1174,13 @@ fn random_seed() -> u64 {
 }
 
 /// Maximum number of addresses that can be requested in a single batch.
+///
+/// `soroban_sdk` collections are indexed by `u32` (`soroban_sdk::Vec::len`
+/// returns `u32`), so a batch larger than `u32::MAX` could never be held in
+/// an SDK collection at all. This constant keeps batches far below that
+/// ceiling — and below sizes that would exhaust test resources — and both
+/// [`TestEnv::addresses`] and [`TestEnv::try_addresses`] reject anything
+/// above it cleanly, before allocating.
 pub const MAX_ADDRESS_BATCH_SIZE: usize = 10_000;
 
 /// A named test actor pairing a human-readable identifier (such as `"alice"` or
@@ -1066,6 +1388,98 @@ impl<'a> std::iter::FusedIterator for AddressIter<'a> {}
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Ledger;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    fn benchmark_batch(mut make: impl FnMut(usize)) -> Duration {
+        const SAMPLES: usize = 64;
+        for i in 0..4 {
+            make(i);
+        }
+        let started = Instant::now();
+        for i in 0..SAMPLES {
+            make(i);
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn construction_cost_stays_close_to_the_raw_sdk_env() {
+        let raw = benchmark_batch(|_| {
+            black_box(TestEnv::fresh_env_with_defaults(&LedgerDefaults::default()));
+        });
+        let wrapped = benchmark_batch(|i| {
+            black_box(TestEnv::with_seed(i as u64));
+        });
+
+        // TestEnv construction should remain little more than constructing the
+        // SDK Env and storing its small amount of configuration. The fixed
+        // 50ms allowance keeps this guard stable on noisy CI runners while
+        // still catching accidental I/O, sleeps, or other heavyweight setup.
+        let budget = raw.saturating_mul(3) + Duration::from_millis(50);
+        assert!(
+            wrapped <= budget,
+            "constructing TestEnv regressed: wrapped={wrapped:?}, raw={raw:?}, budget={budget:?}"
+        );
+    }
+
+    #[test]
+    fn new_uses_the_documented_starting_ledger() {
+        let env = TestEnv::new();
+        let ledger = env.env().ledger().get();
+        assert_eq!(ledger.sequence_number, 0);
+        assert_eq!(ledger.timestamp, 0);
+    }
+
+    struct Fixture {
+        env: TestEnv,
+        first: Address,
+    }
+
+    impl TestFixture for Fixture {
+        fn from_env(env: TestEnv) -> Self {
+            let first = env.address();
+            Self { env, first }
+        }
+
+        fn test_env(&self) -> &TestEnv {
+            &self.env
+        }
+    }
+
+    #[test]
+    fn fixture_with_seed_is_reproducible() {
+        let a = Fixture::with_seed(42);
+        let b = Fixture::with_seed(42);
+        assert_eq!(a.first, b.first);
+        assert_eq!(a.test_env().seed(), 42);
+        assert_eq!(b.test_env().seed(), 42);
+    }
+
+    #[test]
+    fn fixture_new_environments_are_isolated() {
+        let a = Fixture::new();
+        let b = Fixture::new();
+        a.test_env().env().ledger().set_sequence_number(9_999);
+        assert_ne!(a.test_env().sequence(), b.test_env().sequence());
+    }
+
+    #[test]
+    fn fixture_accepts_zero_seed_and_existing_env_configuration() {
+        let zero = Fixture::with_seed(0);
+        assert_eq!(zero.test_env().seed(), 0);
+
+        let configured = Fixture::from_env(TestEnv::with_seed(7).with_ledger_close_interval(2));
+        assert_eq!(configured.test_env().seed(), 7);
+        assert_eq!(configured.test_env().ledger_close_interval(), 2);
+    }
+
+    #[test]
+    fn test_env_itself_implements_fixture() {
+        let env = <TestEnv as TestFixture>::with_seed(11);
+        assert_eq!(env.seed(), 11);
+        assert!(std::ptr::eq(<TestEnv as TestFixture>::test_env(&env), &env));
+    }
 
     #[test]
     fn new_twice_produces_independent_environments() {
@@ -1075,6 +1489,43 @@ mod tests {
         assert_ne!(
             a.env().ledger().get().sequence_number,
             b.env().ledger().get().sequence_number
+        );
+    }
+
+    // Regression test for issue #26: independently created `TestEnv` instances
+    // must not share or leak any state — ledger clock, ledger sequence, or
+    // address-generation counter — between them.
+    #[test]
+    fn independently_created_instances_are_fully_isolated() {
+        let a = TestEnv::new();
+        let b = TestEnv::new();
+
+        // Capture b's baseline before touching a.
+        let b_sequence_before = b.env().ledger().get().sequence_number;
+        let b_timestamp_before = b.env().ledger().get().timestamp;
+
+        // Mutate a's ledger clock through the SDK directly.
+        a.env().ledger().set_sequence_number(77_777);
+        a.env().ledger().set_timestamp(999_999);
+
+        // b must observe none of a's mutations.
+        assert_eq!(
+            b.env().ledger().get().sequence_number,
+            b_sequence_before,
+            "mutating a's sequence must not affect b"
+        );
+        assert_eq!(
+            b.env().ledger().get().timestamp,
+            b_timestamp_before,
+            "mutating a's timestamp must not affect b"
+        );
+
+        // Addresses from each environment must be independent of each other.
+        let addr_from_a = a.address();
+        let addr_from_b = b.address();
+        assert_ne!(
+            addr_from_a, addr_from_b,
+            "addresses generated from independent environments must differ"
         );
     }
 
@@ -1526,5 +1977,445 @@ mod tests {
         let env =
             TestEnv::with_ledger_defaults(LedgerDefaults::new().protocol_version(current_protocol));
         assert_eq!(env.metadata().protocol_version, current_protocol);
+    }
+
+    // --- Named actor generation (#36) -----------------------------------
+
+    #[test]
+    fn actor_creates_actor_with_expected_name_and_address() {
+        let env = TestEnv::new();
+        let alice = env.actor("alice");
+        assert_eq!(alice.name(), "alice");
+        assert_eq!(alice.address(), &*alice);
+        assert_eq!(format!("{alice}"), "alice");
+    }
+
+    #[test]
+    fn actor_diagnostic_formats_name_and_debug_address() {
+        let env = TestEnv::new();
+        let alice = env.actor("alice");
+        let diag = alice.diagnostic();
+        assert!(diag.starts_with("alice ("));
+        assert!(diag.ends_with(')'));
+    }
+
+    #[test]
+    fn actor_derefs_and_compares_with_address() {
+        let env = TestEnv::new();
+        let alice = env.actor("alice");
+        let raw_addr: &Address = &alice;
+        assert_eq!(raw_addr, alice.address());
+        assert_eq!(alice, *alice.address());
+        assert_eq!(*alice.address(), alice);
+
+        let bob = env.actor("bob");
+        assert_ne!(alice, bob);
+    }
+
+    #[test]
+    fn actor_into_address_returns_underlying_address() {
+        let env = TestEnv::new();
+        let alice = env.actor("alice");
+        let expected = alice.address().clone();
+        assert_eq!(alice.into_address(), expected);
+    }
+
+    #[test]
+    fn try_actor_accepts_valid_names() {
+        let env = TestEnv::new();
+        assert!(env.try_actor("alice").is_ok());
+        assert!(env.try_actor("treasury_1").is_ok());
+        assert!(env.try_named_actor("admin").is_ok());
+    }
+
+    #[test]
+    fn try_actor_rejects_empty_or_whitespace_names() {
+        let env = TestEnv::new();
+        let err_empty = env.try_actor("").unwrap_err();
+        assert_eq!(err_empty.code(), "TESTKIT_MISUSE");
+        assert_eq!(
+            err_empty.message(),
+            "actor name cannot be empty or only whitespace"
+        );
+
+        let err_space = env.try_actor("   \t\n").unwrap_err();
+        assert_eq!(err_space.code(), "TESTKIT_MISUSE");
+    }
+
+    #[test]
+    #[should_panic(expected = "actor name cannot be empty or only whitespace")]
+    fn actor_panics_on_empty_name() {
+        let env = TestEnv::new();
+        let _ = env.actor("");
+    }
+
+    #[test]
+    #[should_panic(expected = "actor name cannot be empty or only whitespace")]
+    fn named_actor_panics_on_whitespace_name() {
+        let env = TestEnv::new();
+        let _ = env.named_actor("   ");
+    }
+
+    #[test]
+    fn actors_batch_generates_distinct_actors() {
+        let env = TestEnv::new();
+        let actors = env.actors(&["alice", "bob", "charlie"]);
+        assert_eq!(actors.len(), 3);
+        assert_eq!(actors[0].name(), "alice");
+        assert_eq!(actors[1].name(), "bob");
+        assert_eq!(actors[2].name(), "charlie");
+        assert_ne!(actors[0].address(), actors[1].address());
+        assert_ne!(actors[1].address(), actors[2].address());
+        assert_ne!(actors[0].address(), actors[2].address());
+    }
+
+    #[test]
+    fn try_actors_rejects_duplicate_names() {
+        let env = TestEnv::new();
+        let err = env.try_actors(&["alice", "bob", "alice"]).unwrap_err();
+        assert_eq!(err.code(), "TESTKIT_MISUSE");
+        assert!(err.message().contains("duplicate actor name \"alice\""));
+    }
+
+    #[test]
+    fn try_actors_rejects_blank_name() {
+        let env = TestEnv::new();
+        let err = env.try_actors(&["alice", ""]).unwrap_err();
+        assert_eq!(err.code(), "TESTKIT_MISUSE");
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate actor name")]
+    fn actors_panics_on_duplicate_name() {
+        let env = TestEnv::new();
+        let _ = env.actors(&["admin", "admin"]);
+    }
+
+    // --- Address iterator (#37) -----------------------------------------
+
+    #[test]
+    fn address_iter_yields_fresh_distinct_addresses() {
+        let env = TestEnv::new();
+        let addrs: Vec<Address> = env.address_iter().take(5).collect();
+        assert_eq!(addrs.len(), 5);
+        for i in 0..addrs.len() {
+            for j in (i + 1)..addrs.len() {
+                assert_ne!(addrs[i], addrs[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn addresses_iter_alias_behaves_identically() {
+        let env = TestEnv::new();
+        let mut iter = env.addresses_iter();
+        let a = iter.next().unwrap();
+        let b = iter.next().unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn address_iter_reproducible_with_seed() {
+        let env1 = TestEnv::with_seed(12345);
+        let env2 = TestEnv::with_seed(12345);
+        let seq1: Vec<Address> = env1.address_iter().take(4).collect();
+        let seq2: Vec<Address> = env2.address_iter().take(4).collect();
+        assert_eq!(seq1, seq2);
+    }
+
+    #[test]
+    fn address_iter_size_hint_and_cloning() {
+        let env = TestEnv::new();
+        let iter = env.address_iter();
+        let (lower, upper) = iter.size_hint();
+        assert_eq!(lower, usize::MAX);
+        assert_eq!(upper, None);
+
+        let mut iter_clone = iter.clone();
+        assert!(iter_clone.next().is_some());
+    }
+
+    // --- Checked address batch API (#38) --------------------------------
+
+    #[test]
+    fn try_addresses_succeeds_for_valid_batch_sizes() {
+        let env = TestEnv::new();
+        let one = env.try_addresses(1).unwrap();
+        assert_eq!(one.len(), 1);
+
+        let five = env.try_addresses(5).unwrap();
+        assert_eq!(five.len(), 5);
+        for i in 0..five.len() {
+            for j in (i + 1)..five.len() {
+                assert_ne!(five[i], five[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn checked_addresses_alias_succeeds() {
+        let env = TestEnv::new();
+        let res = env.checked_addresses(3);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn try_addresses_rejects_zero_count() {
+        let env = TestEnv::new();
+        let err = env.try_addresses(0).unwrap_err();
+        assert_eq!(err.code(), "TESTKIT_MISUSE");
+        assert_eq!(
+            err.message(),
+            "address batch size must be at least 1; requested 0 addresses"
+        );
+    }
+
+    #[test]
+    fn try_addresses_rejects_excessive_batch_size() {
+        let env = TestEnv::new();
+        let err = env.try_addresses(MAX_ADDRESS_BATCH_SIZE + 1).unwrap_err();
+        assert_eq!(err.code(), "TESTKIT_MISUSE");
+        assert!(err.message().contains("exceeds the maximum limit"));
+
+        let err_max = env.try_addresses(usize::MAX).unwrap_err();
+        assert_eq!(err_max.code(), "TESTKIT_MISUSE");
+    }
+
+    #[test]
+    fn try_addresses_reproducible_for_same_seed() {
+        let env1 = TestEnv::with_seed(999);
+        let env2 = TestEnv::with_seed(999);
+        let batch1 = env1.try_addresses(4).unwrap();
+        let batch2 = env2.try_addresses(4).unwrap();
+        assert_eq!(batch1, batch2);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #24 — seeded address determinism after interleaved batches
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn seeded_address_streams_align_across_interleaved_batches() {
+        // Two same-seed environments interleaving batches of different
+        // sizes must keep issuing the same global sequence.
+        let a = TestEnv::with_seed(42);
+        let b = TestEnv::with_seed(42);
+
+        let a1 = a.addresses(3);
+        let b1 = b.addresses(5);
+        let a2 = a.addresses(2);
+        let b2 = b.addresses(4);
+
+        let reference = TestEnv::with_seed(42).addresses(9);
+
+        let mut a_stream = a1.clone();
+        a_stream.extend(a2);
+        assert_eq!(a_stream, reference[..5]);
+
+        let mut b_stream = b1;
+        b_stream.extend(b2);
+        assert_eq!(b_stream, reference[..]);
+    }
+
+    #[test]
+    fn seeded_address_batches_survive_interleaved_raw_env_generation() {
+        // Regression test for the root cause: address batches used to draw
+        // from the SDK generator shared with every raw handle reachable
+        // through `env()`, so interleaving a raw batch shifted every
+        // subsequent testkit address and broke the seeded sequence.
+        use soroban_sdk::testutils::Address as _;
+
+        let env = TestEnv::with_seed(42);
+        let reference = TestEnv::with_seed(42);
+
+        let e1 = env.addresses(3);
+        let r1 = reference.addresses(3);
+        assert_eq!(e1, r1);
+
+        // Interleave a raw address batch through the escape hatch.
+        let handle = env.env().clone();
+        let _raw: Vec<Address> = (0..2).map(|_| Address::generate(&handle)).collect();
+
+        let e2 = env.addresses(3);
+        let r2 = reference.addresses(3);
+        assert_eq!(e2, r2, "seeded batch shifted by interleaved raw batch");
+    }
+
+    #[test]
+    fn interleaved_raw_generation_does_not_shift_actor_batches() {
+        use soroban_sdk::testutils::Address as _;
+
+        let env = TestEnv::with_seed(7);
+        let reference = TestEnv::with_seed(7);
+
+        let alice = env.actor("alice");
+        let _raw = Address::generate(env.env());
+        let bob = env.actor("bob");
+
+        let ref_alice = reference.actor("alice");
+        let ref_bob = reference.actor("bob");
+        assert_eq!(alice.address(), ref_alice.address());
+        assert_eq!(bob.address(), ref_bob.address());
+    }
+
+    #[test]
+    fn generated_addresses_never_collide_with_the_sdk_generator_stream() {
+        // Regression test for the shared-layout root cause: the testkit
+        // stream and the SDK generator both start at 1, so a shared byte
+        // layout made `env.address() #1` equal the first registered
+        // contract's id — breaking auth matrices and balance assertions
+        // that treat the two as distinct parties.
+        use soroban_sdk::testutils::Address as _;
+
+        let env = TestEnv::new();
+        let mine = env.addresses(5);
+        let raw: Vec<Address> = (0..5).map(|_| Address::generate(env.env())).collect();
+        for m in &mine {
+            for r in &raw {
+                assert_ne!(m, r, "testkit address collided with raw generator stream");
+            }
+        }
+
+        let vault_id = env.env().register(vault::Vault, ());
+        assert!(
+            !mine.contains(&vault_id),
+            "testkit address collided with a registered contract id"
+        );
+        assert_ne!(
+            env.address(),
+            vault_id,
+            "next testkit address collided with a registered contract id"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #25 — clean rejection of oversized address batches
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn addresses_allows_batches_up_to_the_documented_limit() {
+        let env = TestEnv::new();
+        assert_eq!(
+            env.addresses(MAX_ADDRESS_BATCH_SIZE).len(),
+            MAX_ADDRESS_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "misuse of testkit API: requested address batch size 10001 exceeds the maximum limit of 10000"
+    )]
+    fn addresses_rejects_batches_above_the_limit_cleanly() {
+        // Regression test: this used to silently generate the batch instead
+        // of rejecting it.
+        let _ = TestEnv::new().addresses(MAX_ADDRESS_BATCH_SIZE + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the maximum limit of 10000")]
+    fn addresses_rejects_batches_beyond_sdk_collection_limits_cleanly() {
+        // A batch of usize::MAX can never fit an SDK collection (elements
+        // are u32-indexed); it must fail with a clear Misuse message before
+        // any allocation is attempted.
+        let _ = TestEnv::new().addresses(usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "misuse of testkit API: address batch size must be at least 1; requested 0 addresses"
+    )]
+    fn addresses_rejects_zero_sized_batches() {
+        let _ = TestEnv::new().addresses(0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #31 — Default matching TestEnv::new
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_matches_new_starting_ledger_and_configuration() {
+        let default_env = TestEnv::default();
+        let new_env = TestEnv::new();
+
+        // Same deterministic starting ledger.
+        assert_eq!(
+            default_env.env().ledger().get(),
+            new_env.env().ledger().get()
+        );
+        // Same configuration surface.
+        assert_eq!(
+            default_env.metadata().close_interval_override,
+            new_env.metadata().close_interval_override
+        );
+        assert_eq!(
+            default_env.ledger_defaults().timestamp_override(),
+            new_env.ledger_defaults().timestamp_override()
+        );
+        assert_eq!(
+            default_env.ledger_defaults().sequence_number_override(),
+            new_env.ledger_defaults().sequence_number_override()
+        );
+    }
+
+    #[test]
+    fn default_issues_distinct_addresses_like_new() {
+        // Address streams are seed-derived, and default/new each draw a
+        // fresh random seed, so the sequences are compared behaviorally
+        // rather than byte-for-byte: both must yield `n` distinct
+        // addresses, exactly as a same-seed rebuild would.
+        for env in [TestEnv::default(), TestEnv::new()] {
+            let addrs = env.addresses(3);
+            assert_eq!(addrs.len(), 3);
+            for i in 0..addrs.len() {
+                for j in (i + 1)..addrs.len() {
+                    assert_ne!(addrs[i], addrs[j]);
+                }
+            }
+        }
+        // Same-seed environments still reproduce each other's sequences.
+        assert_eq!(
+            TestEnv::with_seed(42).addresses(3),
+            TestEnv::with_seed(42).addresses(3)
+        );
+    }
+
+    #[test]
+    fn default_twice_produces_independent_environments() {
+        // Mirrors `new_twice_produces_independent_environments`: Default
+        // must delegate to `new`, so two defaults are independent too.
+        let a = TestEnv::default();
+        let b = TestEnv::default();
+        a.env().ledger().set_sequence_number(12_345);
+        assert_ne!(
+            a.env().ledger().get().sequence_number,
+            b.env().ledger().get().sequence_number
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #32 — ownership and lifetime of the raw Env escape hatch
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn env_escape_hatch_aliases_the_owned_sdk_env() {
+        let env = TestEnv::new();
+        let sdk_env: &soroban_sdk::Env = env.env();
+        sdk_env.ledger().set_sequence_number(777);
+        // Mutations through the `&Env` are visible through the TestEnv:
+        // it is a borrow of the same environment, not a copy.
+        assert_eq!(env.sequence(), 777);
+    }
+
+    #[test]
+    fn cloned_env_handle_shares_state_with_the_testenv() {
+        let env = TestEnv::new();
+        let handle = env.env().clone();
+        handle.ledger().set_sequence_number(888);
+        assert_eq!(env.sequence(), 888);
+
+        // ...and mutations through the TestEnv are visible through the clone.
+        env.advance_ledgers(1);
+        assert_eq!(handle.ledger().sequence(), 889);
     }
 } // end mod tests

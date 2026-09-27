@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fmt;
 
 /// Errors raised by testkit assertion helpers and setup routines.
 ///
@@ -18,7 +19,7 @@ use std::error::Error;
 ///     "misuse of testkit API: events were never captured"
 /// );
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TestkitError {
     /// An assertion helper's expectation about contract state or behavior
     /// was not met (for example, an expected event was never emitted, or a
@@ -31,10 +32,25 @@ pub enum TestkitError {
     DecodeFailed(String),
 
     /// The testkit API was used in a way its contract does not allow (for
-    /// example, asserting on events before capture was enabled, or warping
-    /// the ledger clock backwards).
+    /// example, asserting on events before capture was enabled, warping
+    /// the ledger clock backwards, or providing an invalid address label).
     #[error("misuse of testkit API: {0}")]
     Misuse(String),
+
+    /// Adds high-level context while preserving the nested [`TestkitError`]
+    /// as the standard error source.
+    ///
+    /// This is useful when a helper needs to explain *which operation* failed
+    /// without flattening the original error into a string and losing its
+    /// source chain.
+    #[error("{context}: {source}")]
+    Context {
+        /// Human-readable operation context.
+        context: String,
+        /// The underlying testkit error.
+        #[source]
+        source: Box<TestkitError>,
+    },
 }
 
 impl TestkitError {
@@ -92,7 +108,10 @@ impl TestkitError {
     /// assert!(!err.is_misuse());
     /// ```
     pub fn is_assertion_failed(&self) -> bool {
-        matches!(self, Self::AssertionFailed(_))
+        match self {
+            Self::Context { source, .. } => source.is_assertion_failed(),
+            other => matches!(other, Self::AssertionFailed(_)),
+        }
     }
 
     /// Returns `true` if this error is a [`DecodeFailed`](TestkitError::DecodeFailed).
@@ -107,7 +126,10 @@ impl TestkitError {
     /// assert!(!err.is_misuse());
     /// ```
     pub fn is_decode_failed(&self) -> bool {
-        matches!(self, Self::DecodeFailed(_))
+        match self {
+            Self::Context { source, .. } => source.is_decode_failed(),
+            other => matches!(other, Self::DecodeFailed(_)),
+        }
     }
 
     /// Returns `true` if this error is a [`Misuse`](TestkitError::Misuse).
@@ -122,7 +144,10 @@ impl TestkitError {
     /// assert!(!err.is_assertion_failed());
     /// ```
     pub fn is_misuse(&self) -> bool {
-        matches!(self, Self::Misuse(_))
+        match self {
+            Self::Context { source, .. } => source.is_misuse(),
+            other => matches!(other, Self::Misuse(_)),
+        }
     }
 
     /// The human-readable inner message for this error.
@@ -140,6 +165,7 @@ impl TestkitError {
             TestkitError::AssertionFailed(m)
             | TestkitError::DecodeFailed(m)
             | TestkitError::Misuse(m) => m.as_str(),
+            TestkitError::Context { source, .. } => source.message(),
         }
     }
 
@@ -230,6 +256,29 @@ impl TestkitError {
             TestkitError::AssertionFailed(_) => "TESTKIT_ASSERTION_FAILED",
             TestkitError::DecodeFailed(_) => "TESTKIT_DECODE_FAILED",
             TestkitError::Misuse(_) => "TESTKIT_MISUSE",
+            TestkitError::Context { source, .. } => source.code(),
+        }
+    }
+
+    /// Attach operation context without discarding this error's source chain.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestkitError;
+    ///
+    /// let err = TestkitError::DecodeFailed("expected i128".into())
+    ///     .with_context("decoding transfer amount");
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "decoding transfer amount: failed to decode value: expected i128"
+    /// );
+    /// assert_eq!(err.code(), "TESTKIT_DECODE_FAILED");
+    /// ```
+    pub fn with_context(self, context: impl Into<String>) -> Self {
+        Self::Context {
+            context: context.into(),
+            source: Box::new(self),
         }
     }
 
@@ -248,7 +297,58 @@ impl TestkitError {
             TestkitError::AssertionFailed { .. } => "AssertionFailed",
             TestkitError::DecodeFailed { .. } => "DecodeFailed",
             TestkitError::Misuse { .. } => "Misuse",
+            TestkitError::Context { source, .. } => source.kind(),
         }
+    }
+
+    /// Returns a deterministic, human-readable string representation of this error
+    /// formatted specifically for snapshot testing.
+    ///
+    /// # User-facing behavior
+    ///
+    /// The snapshot output combines the machine-readable error code ([`TestkitError::code`])
+    /// with the human-readable error message in the format `"[CODE] message"`.
+    ///
+    /// - **Deterministic**: Contains no non-deterministic memory addresses, thread IDs, or timestamps.
+    /// - **Stable across runs**: Output remains identical across test executions and platforms.
+    /// - **Readable**: Clearly demarks the error classification code and failure details for snapshot diffs.
+    ///
+    /// # Format
+    ///
+    /// | Variant | Snapshot Output |
+    /// |---|---|
+    /// | [`TestkitError::AssertionFailed`] | `"[TESTKIT_ASSERTION_FAILED] assertion failed: ..."` |
+    /// | [`TestkitError::DecodeFailed`] | `"[TESTKIT_DECODE_FAILED] failed to decode value: ..."` |
+    /// | [`TestkitError::Misuse`] | `"[TESTKIT_MISUSE] misuse of testkit API: ..."` |
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestkitError;
+    ///
+    /// let err = TestkitError::Misuse("events were never captured".into());
+    /// assert_eq!(
+    ///     err.to_snapshot(),
+    ///     "[TESTKIT_MISUSE] misuse of testkit API: events were never captured"
+    /// );
+    /// ```
+    pub fn to_snapshot(&self) -> String {
+        format!("[{}] {}", self.code(), self)
+    }
+
+    /// Alias for [`TestkitError::to_snapshot`].
+    pub fn render_snapshot(&self) -> String {
+        self.to_snapshot()
+    }
+
+    /// Alias for [`TestkitError::to_snapshot`].
+    pub fn snapshot(&self) -> String {
+        self.to_snapshot()
+    }
+
+    /// Alias for [`TestkitError::to_snapshot`].
+    pub fn snapshot_display(&self) -> String {
+        self.to_snapshot()
     }
 
     /// The underlying causes of this error, nearest first.
@@ -287,6 +387,16 @@ fn source_chain<'a>(err: &'a (dyn Error + 'static)) -> Vec<&'a (dyn Error + 'sta
         source = next.source();
     }
     chain
+}
+
+/// `Debug` forwards to `Display` so that `{:?}` and `{}` both produce the
+/// same stable, human-readable message. The derived `Debug` would emit the
+/// Rust enum-variant form (`AssertionFailed("assertion failed: …")`), which
+/// diverges from `Display` and makes snapshot-style assertions fragile.
+impl fmt::Debug for TestkitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 #[cfg(test)]
@@ -590,5 +700,59 @@ mod tests {
 
         let err3 = TestkitError::assertion_failed("test misuse");
         assert_ne!(err1, err3);
+    }
+
+    // Regression test for issue #28: `{:?}` must produce the same stable
+    // output as `{}` so that snapshot assertions and `#[should_panic]` tests
+    // see identical text regardless of which formatter they use.
+    #[test]
+    fn debug_output_matches_display_for_all_variants() {
+        let variants: &[TestkitError] = &[
+            TestkitError::AssertionFailed("deposited != withdrawn".into()),
+            TestkitError::DecodeFailed("expected i128, got Symbol".into()),
+            TestkitError::Misuse("events were never captured".into()),
+        ];
+        for err in variants {
+            assert_eq!(
+                format!("{err:?}"),
+                err.to_string(),
+                "Debug and Display must agree for {}",
+                err.code()
+            );
+        }
+    }
+
+    #[test]
+    fn nested_context_keeps_the_full_display_chain() {
+        let err = TestkitError::DecodeFailed("expected i128, got Symbol".into())
+            .with_context("decoding transfer amount")
+            .with_context("reading transfer event");
+
+        assert_eq!(
+            err.to_string(),
+            "reading transfer event: decoding transfer amount: failed to decode value: expected i128, got Symbol"
+        );
+        assert_eq!(err.code(), "TESTKIT_DECODE_FAILED");
+    }
+
+    #[test]
+    fn nested_context_preserves_error_sources() {
+        use std::error::Error as _;
+
+        let err = TestkitError::Misuse("clock moved backwards".into())
+            .with_context("restoring ledger")
+            .with_context("running at() closure");
+
+        let first = err.source().expect("outer context must expose a source");
+        assert_eq!(
+            first.to_string(),
+            "restoring ledger: misuse of testkit API: clock moved backwards"
+        );
+        let second = first.source().expect("inner context must expose a source");
+        assert_eq!(
+            second.to_string(),
+            "misuse of testkit API: clock moved backwards"
+        );
+        assert!(second.source().is_none());
     }
 }

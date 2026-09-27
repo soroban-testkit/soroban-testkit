@@ -1,0 +1,10 @@
+error[E0502]: cannot borrow `testkit_env` as mutable because it is also borrowed as immutable
+  --> tests/compile_fail/env_ref_cannot_outlive_testenv.rs:16:5
+   |
+13 |     let sdk_env = testkit_env.env(); // &Env — lifetime tied to testkit_env
+   |                   ----------- immutable borrow occurs here
+...
+16 |     testkit_env.reset(); // ERROR: cannot borrow as mutable while `sdk_env` is live
+   |     ^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+17 |     let _ = sdk_env; // extend the escape-hatch borrow past the reset call
+   |             ------- immutable borrow later used here

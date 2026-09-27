@@ -98,8 +98,13 @@ soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm 
   --fn batch_payout --ramp recipients
 
 # Static checks: missing require_auth, unchecked i128 arithmetic,
-# storage reads with no TTL bump. Not a security product.
+# storage reads with no TTL bump, ignored token-transfer results, and
+# signed amount parameters with no positive-value validation.
 soroban-testkit audit ./src --strict
+
+# Stable machine-readable reports for automation and GitHub code scanning.
+soroban-testkit audit ./src --format json
+soroban-testkit audit ./src --format sarif > audit.sarif
 ```
 
 `limits` ramps numeric and `Bytes` parameters directly, or ramps a `Vec<T>`

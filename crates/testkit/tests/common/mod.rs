@@ -14,7 +14,7 @@ use std::path::PathBuf;
 /// file these tests read is committed on `main`.
 pub fn read_repo_file(relative: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
+        .join("../..")
         .join(relative);
     fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))

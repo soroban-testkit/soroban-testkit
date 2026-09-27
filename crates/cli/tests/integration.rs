@@ -51,6 +51,49 @@ fn audit_reports_no_findings_on_a_clean_directory() {
 }
 
 #[test]
+fn audit_json_output_is_parseable() {
+    let output = run(&["audit", "examples/vault/src", "--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tool"], "soroban-testkit");
+    assert!(report["summary"]["finding_count"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn audit_sarif_output_is_parseable() {
+    let output = run(&["audit", "examples/vault/src", "--format", "sarif"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["version"], "2.1.0");
+    assert!(report["runs"][0]["results"]
+        .as_array()
+        .is_some_and(|results| !results.is_empty()));
+}
+
+#[test]
+fn audit_scans_macro_entry_points_from_stdin() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args(["audit", "-"])
+        .current_dir(workspace_root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run soroban-testkit");
+    std::io::Write::write_all(
+        child.stdin.as_mut().unwrap(),
+        br#"#[contractimpl] impl Contract { fn transfer(env: Env, from: Address) { let value: i128 = 1; let _ = value + 1i128; } }"#,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("<stdin>"), "{stdout}");
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+    assert!(stdout.contains("unchecked-i128-arithmetic"), "{stdout}");
+}
+
+#[test]
 fn limits_finds_the_real_mainnet_write_ceiling_for_batch_payout() {
     let build = Command::new("cargo")
         .args([
