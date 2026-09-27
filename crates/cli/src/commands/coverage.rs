@@ -13,6 +13,8 @@ pub enum Format {
     Lcov,
     /// A browsable HTML report.
     Html,
+    /// Machine-readable coverage data from cargo-llvm-cov.
+    Json,
 }
 
 /// Arguments for `soroban-testkit coverage`.
@@ -39,6 +41,9 @@ pub struct CoverageArgs {
     /// Defaults to the current directory.
     #[arg(long, value_name = "DIR")]
     output_dir: Option<std::path::PathBuf>,
+    /// Write JSON to this path (defaults to coverage.json).
+    #[arg(long, value_name = "PATH")]
+    output: Option<std::path::PathBuf>,
 }
 
 /// Wraps `cargo llvm-cov test`, which handles Soroban's coverage needs
@@ -113,6 +118,16 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
                 .to_string(),
         ));
     }
+    if args.output.is_some() && !matches!(args.format, Format::Json) {
+        return Err(CliError(
+            "--output is only valid with --format json".to_string(),
+        ));
+    }
+    if args.open && matches!(args.format, Format::Json) {
+        return Err(CliError(
+            "--open is only valid with --format html".to_string(),
+        ));
+    }
 
     let mut cmd = Command::new("cargo");
     cmd.arg("llvm-cov").arg("test");
@@ -143,6 +158,16 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
             if let Some(dir) = &args.output_dir {
                 cmd.arg("--output-dir").arg(dir);
             }
+        }
+        Format::Json => {
+            cmd.arg("--json");
+            let output_path = args.output.clone().unwrap_or_else(|| {
+                args.output_dir
+                    .as_ref()
+                    .map(|dir| dir.join("coverage.json"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
+            });
+            cmd.arg("--output-path").arg(output_path);
         }
     }
 
@@ -177,6 +202,7 @@ mod tests {
             include: include.iter().map(|s| s.to_string()).collect(),
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
             output_dir: None,
+            output: None,
         }
     }
 
@@ -358,73 +384,62 @@ mod tests {
         );
     }
 
-    // ---- #229: validate coverage output format before spawning ----
-
     #[test]
-    fn validate_coverage_outputs_passes_for_text_format() {
-        let a = args(&[], &[]);
-        let result = super::validate_coverage_outputs(&a);
-        assert!(
-            result.is_ok(),
-            "text format should always pass validation: {:?}",
-            result.err()
+    fn json_format_writes_default_file() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        assert_eq!(
+            rendered_args(&build_command(&a).unwrap()),
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "coverage.json"
+            ]
         );
     }
 
     #[test]
-    fn validate_coverage_outputs_fails_for_missing_lcov_file() {
+    fn json_format_respects_output_path_and_directory() {
         let mut a = args(&[], &[]);
-        a.format = Format::Lcov;
-        a.output_dir = Some(std::path::PathBuf::from(
-            "/tmp/definitely-nonexistent-coverage-dir-12345",
-        ));
-        let result = super::validate_coverage_outputs(&a);
-        assert!(result.is_err(), "should fail for missing lcov.info");
-        let err_msg = result.unwrap_err().0;
-        assert!(
-            err_msg.contains("not found") || err_msg.contains("coverage output file"),
-            "error message should mention missing file: {}",
-            err_msg
+        a.format = Format::Json;
+        a.output_dir = Some(std::path::PathBuf::from("reports"));
+        assert_eq!(
+            rendered_args(&build_command(&a).unwrap()),
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "reports/coverage.json"
+            ]
+        );
+        a.output = Some(std::path::PathBuf::from("result.json"));
+        assert_eq!(
+            rendered_args(&build_command(&a).unwrap()).last().unwrap(),
+            "result.json"
         );
     }
 
     #[test]
-    fn validate_coverage_outputs_fails_for_missing_html_report() {
+    fn json_output_option_is_rejected_for_other_formats() {
         let mut a = args(&[], &[]);
-        a.format = Format::Html;
-        a.output_dir = Some(std::path::PathBuf::from(
-            "/tmp/definitely-nonexistent-html-coverage-dir-12345",
-        ));
-        let result = super::validate_coverage_outputs(&a);
-        assert!(result.is_err(), "should fail for missing index.html");
-        let err_msg = result.unwrap_err().0;
-        assert!(
-            err_msg.contains("not found") || err_msg.contains("HTML report"),
-            "error message should mention missing report: {}",
-            err_msg
-        );
+        a.output = Some(std::path::PathBuf::from("result.json"));
+        assert!(build_command(&a)
+            .unwrap_err()
+            .0
+            .contains("only valid with --format json"));
     }
 
     #[test]
-    fn validate_coverage_outputs_detects_empty_lcov_file() {
-        let dir = std::env::temp_dir().join(format!("stk-cov-validate-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let lcov_path = dir.join("lcov.info");
-        std::fs::write(&lcov_path, "").unwrap();
-
+    fn json_cannot_be_opened_as_html() {
         let mut a = args(&[], &[]);
-        a.format = Format::Lcov;
-        a.output_dir = Some(dir.clone());
-
-        let result = super::validate_coverage_outputs(&a);
-        assert!(result.is_err(), "should fail for empty lcov.info");
-        let err_msg = result.unwrap_err().0;
-        assert!(
-            err_msg.contains("empty"),
-            "error message should mention empty file: {}",
-            err_msg
-        );
-
-        std::fs::remove_file(lcov_path).ok();
+        a.format = Format::Json;
+        a.open = true;
+        assert!(build_command(&a)
+            .unwrap_err()
+            .0
+            .contains("only valid with --format html"));
     }
 }

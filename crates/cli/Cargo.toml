@@ -15,6 +15,7 @@ clap = { workspace = true, features = ["derive"] }
 clap_complete = "4"
 soroban-sdk = { workspace = true, features = ["testutils"] }
 soroban-spec = "27.0.6"
+stellar-strkey = "=0.0.16"
 syn = { version = "3.0.5", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
